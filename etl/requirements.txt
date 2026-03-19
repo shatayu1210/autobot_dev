@@ -1,0 +1,31 @@
+# Core dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+PyJWT
+cryptography
+
+# Snowflake
+snowflake-connector-python>=3.0.0
+
+# Apache Airflow is already provided by the base image:
+#   apache/airflow:2.7.0-python3.10
+# Keep providers here; they get installed with Airflow constraints in Dockerfile.
+# For Airflow 2.7.0 (Python 3.10), constraints pin this provider to 4.4.2.
+apache-airflow-providers-snowflake==4.4.2
+
+# Airflow metadata DB driver (docker-compose uses postgresql+psycopg2)
+# For Airflow 2.7.0 constraints (Python 3.10), this is pinned to 2.9.7.
+psycopg2-binary==2.9.7
+
+# Data processing
+pandas>=2.0.0
+
+# Optional: GCP/Vertex AI support (uncomment to enable GCS uploads)
+google-cloud-storage>=2.10.0
+# pyarrow>=12.0.0
+
+# Optional: For future ML features
+# openai>=1.0.0
+# anthropic>=0.3.0
+
+tqdm>=4.66.0

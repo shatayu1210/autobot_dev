@@ -1,0 +1,37 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*private-key*
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Airflow/local runtime artifacts
+logs/
+plugins/__pycache__/
+
+# Local test/backup outputs
+test_output/
+checkpoints_backup/
+backups/
+commands.txt
+temp_script.py
+
+# OS/editor artifacts
+.DS_Store
+.idea/
+.vscode/
+
+# Documents
+*.docx
