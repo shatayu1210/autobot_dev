@@ -9,7 +9,8 @@ Monorepo for AutoBot data and tooling. Today this repo focuses on **ETL** (GitHu
 | Path | Purpose |
 |------|---------|
 | **`etl/`** | Apache Airflow + Docker setup, DAGs, and Python deps for extract / clean / snapshot pipelines |
-| *(future)* | e.g. `training/`, `notebooks/`, `labelling/` — add as needed |
+| **`training/`** | Notebooks and training scripts (e.g. planner training + symbol context prep) |
+| *(future)* | e.g. `labelling/`, `notebooks/` — add as needed |
 
 ---
 
