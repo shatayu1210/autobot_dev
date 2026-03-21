@@ -218,6 +218,10 @@ __marimo__/
 labelling/data/raw_prs.csv
 labelling/data/snapshot_issues_all.csv
 
+# Large model files (stored on Snowflake/Drive)
+*.safetensors
+!training/training_outputs/scorer/scorer_lora_adapter/adapter_model.safetensors
+
 # AutoBot project-specific
 *.docx
 *.pem
