@@ -136,8 +136,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -211,3 +213,19 @@ __marimo__/
 
 # Local venv for tree-sitter tooling
 .venv-treesitter/
+
+# Large data files (too big for GitHub)
+labelling/data/raw_prs.csv
+labelling/data/snapshot_issues_all.csv
+
+# AutoBot project-specific
+*.docx
+*.pem
+*.key
+*private-key*
+test_output/
+test_snapshots/
+checkpoints_backup/
+backups/
+temp_script.py
+.DS_Store
