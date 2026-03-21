@@ -229,3 +229,4 @@ checkpoints_backup/
 backups/
 temp_script.py
 .DS_Store
+slackbot/.git/
