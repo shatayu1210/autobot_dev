@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
+import { parseAutobotDeepLink } from "./deepLink";
 import {
+  copyOpenInEditorDeepLink,
   fetchIssue,
+  openIssueFromDeepLink,
   openIssueInteractive,
   runCriticStep,
   runFullLoop,
@@ -27,6 +30,29 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(treeView, out);
 
   const refresh = () => tree.refresh();
+
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri: async (uri: vscode.Uri) => {
+        if (uri.scheme !== vscode.env.uriScheme) {
+          vscode.window.showErrorMessage(`AutoBot: unexpected URI scheme ${uri.scheme}`);
+          return;
+        }
+        const parsed = parseAutobotDeepLink(uri);
+        if (!parsed.ok) {
+          vscode.window.showErrorMessage(`AutoBot deep link: ${parsed.message}`);
+          return;
+        }
+        try {
+          await openIssueFromDeepLink(session, parsed.value, context.secrets, out);
+          refresh();
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          vscode.window.showErrorMessage(`AutoBot: ${msg}`);
+        }
+      },
+    })
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("autobot.openIssue", async () => {
@@ -80,6 +106,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("autobot.showRepoIndex", async () => {
       await showRepoIndex(out);
+    })
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("autobot.copyOpenLink", async () => {
+      await copyOpenInEditorDeepLink(session);
     })
   );
 }

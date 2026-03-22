@@ -1,0 +1,769 @@
+**AutoBot**
+
+Bottleneck Detector + Autonomous Patch Planner
+
+_Training Plan, Architecture, Fields, Guardrails & Deployment Reference_
+
+March 2026 | Confidential Working Document
+
+| 1. Product Overview & End User Experience |
+| --- |
+
+## 1.1 What This System Does
+
+AutoBot is a two-feature engineering intelligence system built on top of a live GitHub repository. It monitors open issues for bottleneck risk and autonomously proposes code patches for flagged issues.
+
+## 1.2 Feature 1 — Bottleneck Detector
+
+A two-model pipeline that scores every open issue for bottleneck risk every 30 minutes and delivers alerts and ranked lists to engineering teams via Slack.
+
+**End user flow:**
+
+*   Model 1 (Qwen2.5-1.5B, lightweight scorer) polls all open issues every 30 minutes via GitHub MCP and outputs a risk float 0.0–1.0 per issue
+*   Issues scoring above a configurable threshold (default 0.65) are passed to Model 2 (Qwen2.5-Instruct 7B, reasoner)
+*   Model 2 receives the issue text, PR state, score, and generates a 2–3 sentence analyst narrative explaining why the issue is flagged
+*   A Slack alert is posted: issue title, score badge, and the narrative reason
+*   On demand, a user can ask the Slack bot for the top-N open issues sorted by risk score, with optional reasons for each
+*   Non-technical scrum masters can query: 'What are our top 10 bottlenecks this week?' and receive a ranked, reasoned response
+
+**Two sub-modes operate automatically:**
+
+*   Fresh issues (< 3 days): scored on semantic complexity from title/description only, flagged as low-confidence early signal
+*   Operational issues (> 7 days): scored on full signal — text semantics, PR state, stall duration, assignee changes, comment gaps
+
+## 1.3 Feature 2 — Autonomous Patch Planner (VSCode Plugin)
+
+A three-adapter system packaged as a VSCode extension. The user selects an issue or receives one from the Slack bot, and the system proposes a code patch through a Planner → Patcher → Critic loop validated by an autoresearch-style sandbox.
+
+**End user flow:**
+
+*   User opens VSCode on a cloned Airflow (or any) repo and installs the AutoBot plugin
+*   User types: 'Tell me about issue #124' — the orchestrator calls GitHub MCP and shows live issue status, comments, and linked PRs
+*   Orchestrator asks: 'This issue has a risk score of 0.74. Attempt a patch plan?'
+*   If approved: Planner runs — produces a structured plan (files, functions, strategy)
+*   User reviews the plan. If accepted: Patcher generates a unified diff targeting exact function spans via Tree-sitter
+*   Critic evaluates the diff — ACCEPT / REVISE / REJECT with line-level reasoning
+*   On ACCEPT: sandbox branch created, tests run, results shown; user can open a PR draft with one click
+*   On REVISE: Patcher reruns with Critic feedback, max 2–3 iterations
+
+| 2. System Architecture & Orchestrators |
+| --- |
+
+## 2.1 Five Models at a Glance
+
+| Model | Base | Adapter | Task | Triggered By |
+| --- | --- | --- | --- | --- |
+| Bottleneck Scorer | Qwen2.5-1.5B | LoRA (SEQ_CLS) | Float 0.0–1.0 risk score | 30-min cron on all open issues |
+| Bottleneck Reasoner | Qwen2.5-Instruct 7B | LoRA (SFT) | 2–3 sentence analyst narrative | Score > threshold |
+| Planner | Qwen2.5-Coder 7B Instruct | LoRA Adapter 1 | Structured patch plan | User approval in VSCode |
+| Patcher | Qwen2.5-Coder 7B Instruct | LoRA Adapter 2 | Unified diff output | Planner output |
+| Critic | Qwen2.5-Coder 7B Instruct | LoRA Adapter 3 | ACCEPT / REVISE / REJECT + reasons | Patcher diff output |
+
+## 2.2 Orchestrator 1 — Slack Bot
+
+Serves as the always-on bottleneck monitoring surface. Responsibilities:
+
+*   Triggers Model 1 polling every 30 minutes via GitHub MCP
+*   Routes issues above threshold to Model 2 and posts formatted Slack alerts
+*   Responds to natural language queries: top-N issues, score for a specific issue, weekly digest
+*   Passes flagged issue numbers to the VSCode orchestrator on user request
+
+## 2.3 Orchestrator 2 — VSCode Plugin
+
+Serves as the patch planning workspace. Responsibilities:
+
+*   Accepts issue numbers from the user or from Slack bot handoff
+*   Calls GitHub MCP for live issue state and PR details
+*   Runs routing gate classifier: 'does this issue require a code change?' — routes to patch flow or summary-only flow
+*   Drives the Planner → Patcher → Critic loop with user confirmation gates (only after routing gate returns true)
+*   Uses Tree-sitter to parse the local repo for precise function-span context injection
+*   Runs the autoresearch sandbox loop after Critic approval — applies patch, runs tests, reports results
+*   Formats PR title/body draft on successful validation
+
+## 2.4 Where NeMo and Autoresearch Fit
+
+These are NOT training tools. They are production runtime components deployed with the VSCode plugin.
+
+| Component | What it is | Where it plugs in | What it does for you |
+| --- | --- | --- | --- |
+| NVIDIA NeMo Guardrails | Python library for LLM output control | Wraps all 5 model inference calls | Blocks off-topic outputs, enforces response schema, prevents hallucinated file paths or functions that don't exist in the repo |
+| NemoClaw / OpenShell | Kernel-level sandbox runtime for agents | Wraps all tool execution in VSCode plugin | Isolates file reads/writes, blocks network except GitHub MCP, prevents privilege escalation during patch application and test runs |
+| Autoresearch-style loop | Autonomous test-and-revise loop pattern | Post-Critic in VSCode orchestrator | Applies patch in sandbox branch, runs unit tests/lint, feeds failure logs back to Critic/Patcher for up to N=3 iterations |
+| Tree-sitter | Code structure parser (not an LLM) | Pre-Planner (index build) and in-Patcher (span extraction) | Builds symbol index for Planner context; extracts exact function/class blocks for Patcher input; re-parses after patch for structural sanity check |
+
+_NeMo Guardrails setup is straightforward — pip install nemoguardrails, define a .co config file per model, wrap inference. It is a post-deployment python library. Plan ~1 day to configure per model._
+
+| 3. GitHub API Endpoints (Complete Extract Pipeline) |
+| --- |
+| Category | Endpoint | Frequency | Model Utility | Core Intent |
+| --- | --- | --- | --- | --- |
+| Discovery | GET /repos/{owner}/{repo}/issues?state=closed&per_page=100 | Paginated once (ETL) | All models — entry point | Enumerate all closed issue numbers to drive per-issue loop |
+| Discovery | GET /repos/{owner}/{repo}/pulls?state=closed&per_page=100 | Paginated once (ETL) | All models — entry point | Enumerate all closed PR numbers to drive per-PR loop |
+| Core Issue | GET /repos/{owner}/{repo}/issues/{number} | Per issue | Planner: full body/task list context | Title, body, labels, assignees, created_at, closed_at, milestone |
+| Discussion | GET /repos/{owner}/{repo}/issues/{number}/comments | Per issue | Planner + Bottleneck: user context and nuance | Full comment thread with author and timestamps |
+| Hierarchy | GET /repos/{owner}/{repo}/issues/{number}/sub_issues | Per issue | Bottleneck: official parent-child links | Sub-issue relationships for dependency mapping |
+| Timeline | GET /repos/{owner}/{repo}/issues/{number}/timeline | Per issue | Bottleneck: master friction and latency signals | Reassignments, cross-references, label changes, PR linkage events |
+| Solution | GET /repos/{owner}/{repo}/pulls/{number} | Per PR | Planner: PR description and base SHA | PR title, body, state, base.sha, head.sha, merge status |
+| Code Changes | GET /repos/{owner}/{repo}/pulls/{number}/files | Per PR | Patcher: unified diff and file paths | filename, additions, deletions, patch (unified diff) |
+| Review Meta | GET /repos/{owner}/{repo}/pulls/{number}/reviews | Per PR | Critic: overall status | APPROVED / CHANGES_REQUESTED / COMMENTED + review body |
+| Review Detail | GET /repos/{owner}/{repo}/pulls/{number}/comments | Per PR | Critic: line-level revision reasons | Inline code review comments with line references |
+| Iteration | GET /repos/{owner}/{repo}/pulls/{number}/commits | Per PR | Bottleneck: dev reaction speed | Commit timestamps to compute time between issue open and first commit |
+| Validation | GET /repos/{owner}/{repo}/commits/{ref}/check-runs | Per PR | Critic + Bottleneck: CI pass/fail | Check run conclusions (success/failure/skipped) per commit SHA |
+| Stall Signal | GET /repos/{owner}/{repo}/pulls/{number}/requested_reviewers | Per PR | Bottleneck: reviewer assigned but silent | Cross-reference with /reviews — requested with no submission = stall evidence |
+
+_Note: At inference time (30-min polling), the Discovery endpoints switch to state=open. Same endpoints, different param. Do not hardcode state=closed in discovery logic._
+
+| 4. Training Fields Per Model |
+| --- |
+
+All models are trained on historical issues using a 'Temporal Harvesting' approach with snapshots at T+7, T+15, T+22, T+29, T+36, and T+44. (14 days after issue open date). Fields available after that snapshot cutoff are excluded during ETL to prevent data leakage. Sparse data at T+14 (e.g. zero comments) is valid signal, not a problem.
+
+## 4.1 Model 1 — Bottleneck Scorer (Qwen2.5-1.5B)
+
+Purpose: Output a single float 0.0–1.0. Input must be a text string — the model learns to map textual + numeric signals into a score.
+
+Fields used as model input (formatted as a single prompt string):
+
+*   **Signal:** issue.title
+    *   Semantic complexity — 'migrate auth system' vs 'fix tooltip'. The strongest fresh-issue signal.
+*   **Signal:** issue.body (truncated to 400 tokens)
+    *   Scope and ambiguity of the problem statement.
+*   **Signal:** issue.labels\[\]
+    *   Priority and type tags (bug/enhancement/blocked). Include raw label names.
+*   **Signal:** issue.assignees\[\] — count and login names
+    *   Zero assignees = unowned. Multiple changes = ownership confusion.
+*   **Signal:** issue\_comments — first 3 and last 3 by created\_at at T+14
+    *   Early clarification vs late stall. Comment gap (max silence between consecutive comments) is computed from timestamps and injected as a numeric string.
+*   **Signal:** days\_open — computed field (snapshot\_date minus created\_at)
+    *   Injected as 'Days open at snapshot: N'. Relative to project P75 for calibration.
+*   **Signal:** project\_p50\_days, project\_p75\_days, project\_p90\_days — computed from full corpus
+    *   Injected into prompt to give the model a relative baseline. Critical to prevent Iceberg-style bias.
+*   Signal: linked\_prs\[\] — filtered by PR creation date to ensure no data leakage from PRs opened after the snapshot date, days\_since\_last\_review, review\_count, was\_closed\_without\_merge
+    *   PR stall is the strongest operational bottleneck signal. Crucially, PR counts are re-derived at each snapshot by comparing PR creation dates against the snapshot date to prevent future-knowledge leakage.
+*   **Signal:** requested\_reviewers\_with\_no\_review — boolean, computed from /requested\_reviewers vs /reviews
+    *   Silent reviewer assignment = concrete stall evidence.
+*   **Signal:** max\_comment\_gap\_days — computed from issue comment timestamps
+    *   Longest silence in the thread. >14 days is a strong stall marker.
+*   **Signal:** assignee\_change\_count — computed from timeline events
+    *   Ownership bouncing. >1 is a risk flag.
+*   **Signal:** has\_sub\_issues — boolean
+    *   Hierarchical dependency. Adds complexity weight.
+*   **Signal:** ci\_failed — boolean, from check-runs on linked PR head SHA
+    *   CI failure with no follow-up commit = patch abandoned.
+
+Label (ground truth float): Hybrid programmatic score (60%) + GPT-4o semantic adjustment (40%), described in Section 5.
+
+## 4.2 Model 2 — Bottleneck Reasoner (Qwen2.5-Instruct 7B)
+
+Purpose: Generate a 2–3 sentence analyst narrative explaining the score. Receives Model 1's output score as part of its input.
+
+All Model 1 fields, PLUS:
+
+*   **Additional input:** risk\_score — float from Model 1
+    *   Injected as 'Risk Score: 0.74'. Model must anchor its narrative to this.
+*   **Additional input:** pr\_review\_comments — inline code-level comments from /pulls/{number}/comments
+    *   Enables the model to cite specific review friction like 'reviewer flagged missing error handling on line 142'.
+*   **Additional input:** Full PR review bodies from /reviews
+    *   CHANGES\_REQUESTED bodies explain what the reviewer objected to — rich narrative fuel.
+*   **Additional input:** timeline cross-references — other issues/PRs referenced in this issue's timeline
+    *   Enables citing cross-team or cross-repo dependency stalls by name.
+
+Label (ground truth narrative): GPT-4o generated 2–3 sentence paragraph (not a list). Teacher prompt must specify narrative format, project-relative context, and ban bullet points. See Section 5. Truncation for Reasoner (apply in this priority order until within 2048 tokens): (1) issue body after 600 tokens — later sections of bug reports are repetitive; (2) timeline events — keep only assigned, labeled, cross-referenced, review\_requested, drop subscribed/mentioned/referenced; (3) comments — keep first 2 and last 2, drop middle. Title, labels, assignees, risk score, days open, and project percentiles are never truncated — these are the scoring anchors the narrative must reference.
+
+## 4.3 Model 3 — Planner (Qwen2.5-Coder 7B Instruct + LoRA Adapter 1)
+
+Purpose: Given an issue, self-route on whether a code change is needed, then produce a structured patch plan. The routing decision and plan share the same context window and the same inference pass — no separate model needed.
+
+Training input fields:
+
+*   **Core:** issue.title + issue.body
+*   **Core:** issue\_comments — full thread (keep in full; comments are lower token cost than body). Issue body truncated at 800 tokens before tokenisation — later parts of long bug reports are repetitive technical detail with low semantic density. Title, labels, assignees and project percentiles are never truncated.
+*   **Supervision source:** pr.title + pr.body — the merged PR linked to this issue
+*   **Supervision source:** pr\_files\[\].filename — list of all files touched in the merged PR
+    *   This is the strongest planning signal: the ground truth of 'what actually needed changing'.
+*   **Supporting:** pr.commits\[0\].commit.message — first commit message
+    *   Commit messages often explain the root cause succinctly.
+*   **Context:** Tree-sitter repo index snapshot — file-to-symbol map of the repo at base commit
+    *   Injected as a condensed symbol list. Lets the Planner reason about structure without reading full files.
+
+Training target output — two shapes, same LoRA adapter:
+
+YES example output (90% of training set — issues with merged PRs):
+
+| REQUIRES_CODE_CHANGE: YESCONFIDENCE: HIGHREASON: Scheduler crashes on DAGs with >50 tasks, reproducible in prod.PLAN:- Root cause: off-by-one in task slot allocation- Target files: airflow/scheduler/scheduler_job.py- Target functions: _execute_task(), _allocate_slots()- Test strategy: extend test_scheduler.py with >50 task DAG fixture |
+| --- |
+
+NO example output (10% of training set — docs/duplicate/wont-fix issues, NO merged PR):
+
+| REQUIRES_CODE_CHANGE: NOCONFIDENCE: HIGHREASON: Requests documentation update for new config parameter — no code defect present. |
+| --- |
+
+Class imbalance handling — loss weighting (not 50-50 sampling):
+
+*   90-10 YES/NO split is intentional. The Planner's primary job is planning. 50-50 would dilute YES gradient signal and degrade planning accuracy on the model's main task.
+*   To compensate for NO underrepresentation, apply 2x–3x loss weight to NO examples during training. 300 NO examples at 2.5x weight = equivalent gradient signal to ~750 unweighted examples.
+*   This is different from oversampling: oversampling repeats examples and can cause overfitting on the small NO set. Loss weighting amplifies the gradient contribution without duplicating data.
+*   CONFIDENCE: MEDIUM is the graceful degradation path — orchestrator prompts user rather than routing silently. Always surface the REASON line and provide a 'proceed anyway' override.
+
+Orchestrator routing logic on Planner output:
+
+| if decision == 'NO':show_user('Likely no code change needed. Reason: ' + reason)ask_user('Want a summary instead? Or proceed with patch anyway?')elif decision == 'YES' and confidence == 'MEDIUM':ask_user('Planner is uncertain — review plan and confirm?')if approved: show_plan(output)else: # YES + HIGHshow_plan(output) # proceed directly |
+| --- |
+
+## 4.4 Model 4 — Patcher (Qwen2.5-Coder 7B Instruct + LoRA Adapter 2)
+
+Purpose: Given a plan, generate a unified diff patch.
+
+Training input fields:
+
+*   **Core:** Planner's structured plan output
+*   **Core:** Tree-sitter extracted function/class spans — only the blocks identified in the plan, not full files
+    *   Extracted from local repo clone at base commit SHA. Typically 50–300 lines of code per span, not thousands. This solves the 'full file is too expensive' concern entirely.
+*   **Supervision source:** pr\_files\[\].patch — the unified diff from the merged PR (training target)
+    *   Filter to PRs that change fewer than 8 files. Exclude giant refactors.
+
+Training target output: unified diff (the actual PR patch field per file).
+
+_ETL note: Clone Airflow, checkout base.sha from each PR, run Tree-sitter, extract function spans for touched files only. No full-file extraction needed. Apply strict per-PR filter: exclude any PR touching more than 6 files OR with total patch tokens above 2,500. This filter is per PR not per issue — an issue with 10 linked PRs may contribute 3 clean training examples and skip 7 large ones. When a PR exceeds the limit, exclude it entirely (Option 1, recommended for first training run) rather than attempting to select relevant files — a broken partial diff is worse than no example at all. Quality over quantity for Patcher training._
+
+## 4.5 Model 5 — Critic (Qwen2.5-Coder 7B Instruct + LoRA Adapter 3)
+
+Purpose: Evaluate a proposed diff and output ACCEPT / REVISE / REJECT with specific reasoning.
+
+Training input fields:
+
+*   **Context:** issue.title + issue.body
+*   **Context:** Planner's plan
+*   **Core:** Patcher's proposed diff (or the actual PR diff for training)
+*   **Supervision source:** pr\_reviews\[\].body — CHANGES\_REQUESTED bodies from merged/closed PRs
+    *   The reviewer's textual objection is your Critic training signal. 'Missing error handling' = REVISE reason.
+*   **Supervision source:** pr\_review\_comments\[\].body + diff\_hunk + line — inline code comments
+    *   Exact line-level feedback maps directly to Critic's 'revise this specific region' output.
+*   **Supervision source:** check\_runs\[\].conclusion — CI pass/fail per commit
+    *   If CI failed and PR was eventually merged after a fix commit, that commit diff teaches the Critic what to catch.
+
+Training target output: ACCEPT / REVISE / REJECT + 1–3 sentence reasoning. Where review comments exist, use them as ground truth. Where they don’t, use GPT-4o to generate synthetic Critic labels from the diff + CI outcome. Context truncation for Critic: keep PR description + first hunk per file only (capped at ~400 tokens total across all files) + full review comments + full review bodies. A unified diff hunk is the block between @@ markers. Example: given a diff with two hunks — “@@ -142,7 +142,9 @@ ... changes ... @@ -287,6 +289,8 @@ ... more changes ...” — keep only the first @@ block per file and discard everything after the second @@ marker. This gives the Critic enough context to understand what type of change was made and where. Full review comments are always kept in their entirety as they are the primary training signal — the diff is supporting context only.
+
+| 5. Training Approach, Teacher Labelling & Data Sizes |
+| --- |
+
+## 5.1 Data Strategy
+
+*   Source: Apache Airflow GitHub — ~12,719 closed issues, ~43,731 closed PRs
+*   FIRST STEP after pulling all closed issues: compute resolution stats (mean, median, P25, P75, P90). Do not assume a snapshot time before seeing the data.
+*   Snapshot time rule: use ~20–25% of median resolution. If Airflow median is ~110 days, use T+21 to T+28 as snapshot point. If median is 45 days, T+10 is correct.
+*   Take multiple snapshots per issue (T+7, T+15, T+22, T+29, T+36, T+44) provided the issue was physically open at the snapshot time. Each becomes a separate training example with its own independently computed label — NOT the same label.
+*   Include both issues with and without linked PRs — see Section 5.3 for balance breakdown.
+*   Patch Planner models (Planner, Patcher, Critic): only issues with a linked merged PR. No exceptions — they need PR diff as ground truth.
+*   Strip closure signals from all snapshots: resolution\_days, closed\_at, 'closing #', 'merged', 'LGTM', 'merging this', 'fixed in', 'resolved by'
+*   Compute project-wide stats first: P25, P50, P75, P90 — inject into every example for relative calibration
+
+## 5.2 Dual Snapshot Strategy — Why Labels Must Differ
+
+Open issues at inference can be anywhere from 3 days to 90+ days old. Training on a single snapshot teaches the model only one lifecycle stage. Two snapshots per issue force it to learn that risk evolves — and to calibrate differently based on how much time has elapsed and what signals have accumulated.
+
+| Snapshot | Signals visible at that moment | Programmatic score | What the model learns |
+| --- | --- | --- | --- |
+| T+21 | No PR yet, 3 comments, assignee set | 0.42 (medium) | Early signs present but not yet alarming — pattern: watch |
+| T+42 (same issue) | Still no PR, 18-day comment gap, assignee changed once | 0.74 (high) | Prolonged inaction + drift = bottleneck confirmed |
+
+If both snapshots were labelled identically (e.g. both 0.68), the model would learn that T+21 with no signals equals T+42 with clear stall signals. That destroys calibration — it is exactly the Iceberg failure pattern reproduced. Labels must always be computed independently from signals visible at each snapshot point.
+
+The natural exception: an issue that resolved cleanly and quickly will score similarly low at both snapshots (e.g. 0.20 and 0.24). That is correct and expected.
+
+Data volume: ~1,600 unique issues yielding ~4,300 augmented snapshots via multi-snapshotting. training examples for Model 1.
+
+## 5.3 Balance — With PR vs Without PR (Model 1)
+
+An issue with no linked PR after T+21 days is one of the strongest bottleneck signals that exists — nobody started working on it. Training only on issues with PRs makes the model blind to this entire class. Target mix per snapshot batch, applied at both T+N and T+2N:
+
+| Slice | % of batch | What it teaches |
+| --- | --- | --- |
+| Issues with clean merged PR (fast resolution, low friction) | 25% | Low risk baseline — code landed quickly, review was clean, no stalls |
+| Issues with stalled or multi-cycle PR (painful resolution) | 25% | High risk via PR friction — review reverts, CI failures, abandoned PRs. Note: merged PR does not equal low risk; score reflects snapshot-time signals, not final outcome. |
+| Issues with no PR at snapshot, resolved without code change | 20% | Low-medium risk depending on comment activity — model learns no PR is not always alarming |
+| Issues with no PR at snapshot, became long-stalled or re-assigned | 30% | High risk — unstarted drifting issues are the strongest bottleneck class |
+
+Hard risk band balance across the full training set after dual snapshots and PR/no-PR mixing:
+
+| Band | Score Range | Target % | Primary sources |
+| --- | --- | --- | --- |
+| Low risk | 0.0 – 0.35 | 33% | Fast clean-merge issues at T+N; no-PR issues with active healthy comment threads |
+| Medium risk | 0.35 – 0.65 | 34% | Issues near P50–P75; one revision cycle; moderate comment gaps |
+| High risk | 0.65 – 1.0 | 33% | Issues > P90; stalled PRs; no PR + long silence; multiple reassignments; CI failures |
+
+## 5.4 Teacher Labelling — Model 1 (Hybrid)
+
+Step 1: Compute programmatic bottleneck score (60% weight):
+
+*   baseline = min(days\_open / P90, 1.0) × 0.4 (P90 = 22 days)
+*   days\_to\_first\_review > 7 → +0.15 per PR
+*   review\_cycles > 3 → +0.10
+*   was\_closed\_without\_merge → +0.15
+*   max\_comment\_gap > 14 days → +0.15
+*   assignee\_change\_count > 1 → +0.10
+*   requested\_reviewer\_with\_no\_review → +0.10
+*   has\_sub\_issues → +0.05
+
+ci\_failed (pure failure only, NOT mixed CI) → +0.15
+
+Note on CI signal: only fires when ALL check\_run conclusions on the linked PR are “failure”, “timed\_out”, or “cancelled” — does not fire on mixed CI results where any conclusion is passing. Mixed CI fires on 76.8% of PRs and provides no discriminating signal. Signal fires once per issue regardless of how many PRs have CI failures.
+
+Step 2: GPT-4o semantic adjustment (40% weight):
+
+Prompt template (temperature=0):
+
+| You are a senior engineering project analyst. Below is a GitHub issue snapshot from Apache Airflow taken 14 days after it was opened, along with its linked PRs at that time.Project stats: P50={X} days, P75={Y} days, P90={Z} days.Programmatic bottleneck score: {score} ({band}).Based ONLY on the language and semantics of the text below (not the numeric score), output a single float between -0.3 and +0.3 representing how much the text signals MORE or LESS risk than the programmatic score suggests. Then output one sentence explaining why. Format: ADJUSTMENT: <float> REASON: <sentence>[ISSUE SNAPSHOT] |
+| --- |
+
+Final label = clip(0.6 \* programmatic\_score + 0.4 \* (programmatic\_score + gpt4o\_adjustment), 0.0, 1.0)
+
+## 5.5 Teacher Labelling — Model 2 (Reasoner)
+
+GPT-4o generates a narrative paragraph. Temperature=0. Key prompt constraints:
+
+*   Must write 2–3 sentences in paragraph form — NO bullet points, NO lists
+*   Must reference specific signals from the data (not generic statements)
+*   Must be written for a non-technical scrum master — no jargon without explanation
+*   Must acknowledge the risk score and connect it to observable evidence
+*   Bad example to reject: 'Issue has been open a long time. PR has many review cycles. Team may be blocked.'
+*   Good example to accept: 'This issue has been open 23 days — approaching the project P75 of 28 days — with its linked PR stalled at 3 review cycles and no new commit in 11 days. The last review comment requested a change to the scheduler logic that hasn't been addressed, and the original assignee was replaced on day 9, suggesting an ownership handoff mid-implementation.'
+
+## 5.6 Routing Gate — Pre-Planner No-Code-Change Classifier
+
+Not all issues require a code change. Some are resolved via documentation fixes, config updates, or closed as 'won't fix / duplicate'. Training the Planner on these mixed with code-change issues produces a model that sometimes outputs 'no patch needed' with no consistent trigger — unpredictable at inference.
+
+The correct design is a lightweight routing gate that runs before the Planner and answers: does this issue likely require a code change?
+
+| Aspect | Detail |
+| --- | --- |
+| Training data | Closed issues WITHOUT a linked merged PR, labelled as 'no code change needed' (closed as docs/config/won't fix/duplicate) vs 'code change needed but abandoned' (has a linked closed-without-merge PR) |
+| Label source | GPT-4o at temperature=0: given issue title + body + close reason, classify as code_change_needed: true/false with one sentence reason |
+| Model | Simple binary classifier — can be a prompted Qwen2.5-1.5B call or even a rule-based filter on issue labels as MVP |
+| Inference behaviour | Gate returns false → orchestrator tells user: 'This issue likely does not require a code change. Want a summary instead?' Gate returns true → Planner runs normally |
+| Why not confidence on Planner | A Planner confidence score would require the Planner to generate output before knowing if it should. The gate is pre-generative — cheaper, faster, and cleaner separation of concerns |
+
+## 5.7 Teacher Labelling — Planner, Patcher, Critic
+
+*   Planner: No GPT-4o needed. Target output is derived directly from PR metadata (pr.body + pr\_files\[\].filename + commit messages). This is real ground truth.
+*   Patcher: No GPT-4o needed. Target output is the pr\_files\[\].patch field (unified diff). Real ground truth.
+*   Critic: Partial GPT-4o. Where PR review comments exist (CHANGES\_REQUESTED + inline comments), use them as real ground truth. For PRs with no review comments, use GPT-4o to generate a synthetic Critic label from the diff + CI result. Estimated ~40% of examples will need synthetic labels.
+
+## 5.7 GPT-4o Credit Budget (450 credits)
+
+| Task | Examples | Avg tokens/call | Estimated cost | From budget |
+| --- | --- | --- | --- | --- |
+| Model 1: semantic adjustments (8k samples) | 8,000 | ~800 | ~$24 | Yes |
+| Model 2: narrative generation | 2,000 | ~1,200 | ~$14 | Yes |
+| Critic: synthetic labels | 1,200 | ~1,000 | ~$7 | Yes |
+| Routing gate: no-code-change labels | ~1,000 | ~600 | ~$4 | Yes |
+| Quality spot-checks + relabels | ~500 | ~1,000 | ~$3 | Yes |
+| Total |  |  | ~$52 | Well within 450 credits |
+
+## 5.8 GPT-4o vs GPT-4o-mini for Scorer Labelling
+
+GPT-4o is overkill for the scorer adjustment task. The output is narrow and well-defined: a float between -0.3 and +0.3 plus one sentence. GPT-4o-mini handles this reliably at temperature=0 and costs ~15x less. Use GPT-4o-mini for Model 1 scorer labelling. Keep GPT-4o for Model 2 Reasoner narrative generation (open-ended language quality matters there) and for Critic synthetic labels (nuanced code review judgment).
+
+Revised cost estimate using mini for Model 1: scorer labelling drops from ~$24 to ~$1.60, total across all models ~$30 instead of ~$52.
+
+**Spot-check before committing (mandatory):**
+
+*   Before running full 12,826 example labelling, take 10 representative samples (2 very low risk, 2 low, 2 medium, 2 high, 2 very high based on programmatic score) and run them through both GPT-4o and GPT-4o-mini with identical prompts at temperature=0.
+*   Compare the ADJUSTMENT float values and REASON sentences side by side. If mini’s adjustments differ from 4o’s by more than 0.1 on average, or if mini’s REASON sentences are noticeably more generic (e.g. “the issue appears complex” vs 4o’s “the phrase ‘blocked by the providers team’ signals cross-team dependency”), switch to GPT-4o for the full run. Otherwise proceed with mini.
+*   This 10-sample check costs under $0.01 total and takes 2 minutes. Do not skip it.
+
+**Use async for the full labelling run:**
+
+*   Sequential synchronous calls on 12,826 examples at ~0.5s per call = ~1.8 hours. Async with 50 concurrent requests reduces this to ~20–25 minutes. Use Python asyncio with aiohttp or the OpenAI async client. Batch in groups of 50, add a short sleep between batches to avoid hitting rate limits. Save results to a JSONL file incrementally so a crash mid-run doesn’t lose progress.
+*   Same async approach applies to Model 2 Reasoner labelling (~2,000 examples, ~15 minutes async) and Critic synthetic labels (~1,200 examples, ~10 minutes async). Total labelling wall time across all models: under 1 hour.
+
+| 5A. Snapshot Strategy, Token Budget & Per-Model Prompts |
+| --- |
+
+## 5A.1 Actual Project Percentiles and Snapshot Rationale
+
+Resolution percentiles computed on 6,413 cleaned real issues (apache/airflow, post-2019, bot issues excluded):
+
+P25=0 days, P50=1 day, P75=5 days, P90=22 days, P95=44 days, avg=7.9 days.
+
+The 20-25% of median rule (used for slower projects) breaks here because the median is 1 day — giving a meaningless T+0.2 snapshot. Instead T+7 and T+14 are anchored to P75 (5 days). Any issue still open at day 7 is already in the slowest 25% of the project — a natural and meaningful early warning point. T+14 captures the deeper tail with more accumulated stall signal. These four stats are injected into every Scorer and Reasoner training prompt: P50=1, P75=5, P90=22, P95=44.
+
+P25 (0 days) is excluded from prompts — not useful as a reference point. P95 (44 days) is included to give the model a sense of extreme outliers.
+
+## 5A.2 Dual Snapshot Sampling and Band Balancing
+
+After labelling all 12,826 snapshots (6,413 issues x 2), sample the training set as follows. Do NOT enforce T+7 vs T+14 balance — let them fall where they fall. Enforce band balance only:
+
+Step 1: Assign each labelled snapshot to a band: Low (0.0–0.35), Medium (0.35–0.65), High (0.65–1.0).
+
+Step 2: Given Airflow’s fast distribution, Low will dominate. Randomly sample to equalise to the smallest band size, capping at ~1,400 examples per band (~4,200 total across 3 bands).
+
+Step 3: Sanity check after sampling — run: print(df.groupby(‘band’)\[‘snapshot\_tier’\].value\_counts()). If T+7 and T+14 are severely imbalanced within any band (e.g. 90%+ from one tier), stratify-sample within that band by tier. This prevents the model accidentally learning that “early snapshot = always low risk.”
+
+## 5A.2b Snapshot Date Handling — The “Current Date” Problem
+
+Since we are training on historical closed issues but simulating open-issue conditions, the model needs to know how old the issue is at the snapshot moment. The correct approach is NOT to inject a calendar date — that would be noise since every issue has a different created\_at. Instead inject a single computed numeric field: DAYS\_OPEN.
+
+**snapshot\_date serves two distinct purposes:**
+
+*   ETL/transform use only — snapshot\_date = created\_at + 7 days (or 14). Used as the cutoff to filter timeline events, comments, and PR links: keep only records where event.created\_at <= snapshot\_date. This field is NOT injected into the model prompt.
+*   Model input — inject DAYS\_OPEN: N (an integer, e.g. 7 or 14 for training examples). At inference on live open issues this becomes: days\_open = today – issue.created\_at. Same field, same meaning, no training/inference mismatch.
+
+**Where each field is used:**
+
+*   GPT-4o labelling prompt: inject both DAYS\_OPEN: {N} and SNAPSHOT\_TIER: T+7 or T+14. The tier tells GPT-4o which lifecycle point it is evaluating so it weights stall signals appropriately — a missing PR at T+7 is less alarming than at T+14. SNAPSHOT\_TIER is for the teacher only.
+*   Qwen training input: inject DAYS\_OPEN: {N} only. Do NOT include SNAPSHOT\_TIER in the Qwen training prompt — at inference you do not know which “tier” you are at, only how many days the issue has been open. The model must learn to calibrate from days\_open alone.
+*   Planner, Patcher, Critic: these models infer on open issues so DAYS\_OPEN is not a meaningful input for them — they reason about code, not age. Do not inject it for these three models.
+
+**Python transform snippet:**
+
+from datetime import timedelta
+
+for days\_offset, tier in \[(7, "T+7"), (14, "T+14")\]:
+
+snapshot\_date = issue\_created\_at + timedelta(days=days\_offset)
+
+\# Strip: keep only events/comments before snapshot\_date
+
+filtered\_timeline = \[e for e in timeline if parse(e\["created\_at"\]) <= snapshot\_date\]
+
+filtered\_comments = \[c for c in comments if parse(c\["created\_at"\]) <= snapshot\_date\]
+
+\# Null out closure fields
+
+snapshot = build\_prompt(issue, filtered\_comments, filtered\_timeline,
+
+days\_open=days\_offset, # injected as DAYS\_OPEN field
+
+snapshot\_tier=tier) # injected for GPT-4o only
+
+## 5A.3 Per-Model Token Budget and Python Truncation Strategy
+
+For all models: token count is checked BEFORE adding to the training JSONL. Any example exceeding the model’s limit is either truncated per the rules below or discarded. A hard assert in the data prep script ensures no example exceeds the limit. Do not rely on the tokeniser silently truncating — silent truncation cuts the end of the prompt which for most models is the most recent and most relevant content.
+
+**Model 1 — Scorer (1536 tokens):**
+
+Truncation order: (1) issue body at 800 tokens, (2) drop middle comments keeping first 2 + last 2, (3) trim PR titles to 50 tokens each. Never truncate: title, labels, days\_open, project percentiles, PR state fields.
+
+**Model 2 — Reasoner (2048 tokens):**
+
+Truncation order: (1) body at 600 tokens, (2) timeline — keep only assigned/labeled/cross-referenced/review\_requested, (3) comments — keep first 2 + last 2. Never truncate: title, labels, risk\_score, days\_open, percentiles, PR review states.
+
+**Model 3 — Planner (2048 tokens):**
+
+Truncation order: (1) body at 800 tokens, (2) Tree-sitter index at 400 tokens — keep most-referenced symbols first. Never truncate: title, full comments thread (usually short), file list from PR.
+
+**Model 4 — Patcher (3072 tokens):**
+
+No truncation — instead hard filter: discard entire PR if files > 6 OR patch tokens > 2,500. Assert total prompt (plan + code spans + diff target) is under 3,072 before adding to JSONL. Discard over-limit examples entirely.
+
+**Model 5 — Critic (2048 tokens):**
+
+Truncation order: (1) diff — keep first hunk per file only, cap at 400 total diff tokens, (2) PR body at 400 tokens. Never truncate: review\_comments, review bodies (CHANGES\_REQUESTED) — these are the primary signal.
+
+## 5A.4 Planner Output Format — patch\_needed and patch\_need\_confidence
+
+The Planner self-routes on whether a code change is needed before generating a plan. The output format already includes REQUIRES\_CODE\_CHANGE: YES/NO and CONFIDENCE: HIGH/MEDIUM/LOW. These map directly to patch\_needed (boolean) and patch\_need\_confidence fields that the VSCode orchestrator reads to decide routing. When REQUIRES\_CODE\_CHANGE=NO the orchestrator surfaces the REASON to the user and offers a summary-only path. When CONFIDENCE=MEDIUM the orchestrator prompts the user to confirm before proceeding. This classification is baked into the Planner LoRA adapter training — no separate model needed.
+
+For Planner/Patcher/Critic training: closure fields (closed\_at, state=closed, state\_reason, closed\_by, merged\_at, PR merged status) are NOT included in the structured training input even though they exist in raw\_json. The input is constructed field-by-field — only include the fields that would be available on an open issue at inference time. Closure fields exist in the raw data to help compute ground truth labels and supervision signals but must be explicitly excluded when building the training prompt string. The model does not see them and cannot learn to rely on them.
+
+## 5A.5 Per-Model Prompts, Labelling and Training Checks
+
+For each model: GPT-4o labelling prompt (where applicable), Qwen training/inference system prompt, and a checklist to run on 20–30 sample outputs before committing to full labelling or training.
+
+## Model 1 — Bottleneck Scorer
+
+**GPT-4o Labelling Prompt (temperature=0):**
+
+You are a senior engineering project analyst scoring GitHub issue bottleneck risk for Apache Airflow.
+
+Project resolution stats: P50=1 day, P75=5 days, P90=22 days, P95=44 days.
+
+Programmatic bottleneck score (60% weight): {prog\_score}
+
+Based ONLY on the language and semantics of the issue text below (not the programmatic score), output a single float between -0.3 and +0.3 representing how much the text signals MORE or LESS risk than the programmatic score suggests. Then output one sentence explaining why. Be specific — reference actual words or phrases from the issue. Format exactly: ADJUSTMENT: <float> REASON: <one sentence>
+
+ISSUE SNAPSHOT (T+{snapshot\_day} days): {structured\_issue\_text}
+
+**Qwen Training / Inference System Prompt:**
+
+You are a bottleneck risk scorer for GitHub issues. Given an issue snapshot, output a single integer class 0–2 where 0=Low risk, 1=Medium, 2=High. Output the class number only, nothing else.
+
+PROJECT: apache/airflow | P50=1d P75=5d P90=22d P95=44d
+
+ISSUE: {title} | LABELS: {labels} | ASSIGNEES: {assignee\_count} | DAYS\_OPEN: {days\_open} | COMMENT\_COUNT: {comment\_count} | MAX\_COMMENT\_GAP\_DAYS: {gap} | LINKED\_PR\_COUNT: {pr\_count} | PR\_STATES: {pr\_states} | SILENT\_REVIEWERS: {silent} | CI: {ci} | BODY: {truncated\_body} | COMMENTS: {first2\_last2\_comments}
+
+**Test labelling checks (run on 20–30 samples before full run):**
+
+*   ADJUSTMENT values should spread across the -0.3 to +0.3 range, not cluster at 0.0. If 80%+ are 0.0 the semantic signal is not being used — strengthen the prompt instruction to reference specific language.
+*   Final hybrid labels should distribute across all 3 bands — if >60% fall in Low after balancing check your programmatic formula is not over-weighting resolution time.
+*   Spot-check 5 high-score examples: does the REASON actually reference specific language like “blocked by”, “waiting on team”, “architectural rethink”? If it says generic phrases like “issue has been open a long time” the prompt needs strengthening.
+*   T+7 and T+14 labels for the same issue should differ when the issue took >14 days to close — if they are identical the snapshot stripping is not working correctly.
+*   Check no closure fields appear in any snapshot input: grep for “closed\_at”, “state\_reason”, “closed\_by”, “merged\_at” in your training JSONL — none should be present.
+
+**days\_open jitter augmentation (apply during training data prep, after labelling):**
+
+*   Because all training examples have days\_open of exactly 7 or 14, the model risks learning a step function rather than a smooth relationship. At inference it will see any value (1, 3, 45, 90). Apply ±3 day random jitter to the days\_open field during training data preparation — after GPT-4o labelling is complete and before writing the JSONL. The ground truth label stays unchanged; only the days\_open number in the prompt string is varied.
+*   Keep jitter small (±3 max). A T+7 snapshot with days\_open=10 is acceptable — the text may not have 10 days of content but the model has seen sparse snapshots. Do not jitter so far that days\_open contradicts the visible timeline content (e.g. days\_open=1 on a snapshot with 8 comments is implausible). Code: days\_open = max(1, original\_days + random.randint(-3, 3)).
+
+## Model 2 — Bottleneck Reasoner
+
+**GPT-4o Labelling Prompt (temperature=0):**
+
+You are a senior engineering project analyst writing a bottleneck risk briefing for a non-technical scrum master.
+
+Project stats: P50=1 day, P75=5 days, P90=22 days, P95=44 days. Risk score: {score} ({band}).
+
+Write exactly 2–3 sentences as a single paragraph. Rules: (1) no bullet points or lists, (2) must reference at least two specific observable signals from the data below, (3) must mention the risk score and connect it to evidence, (4) no jargon without plain-English explanation, (5) must mention how many days open and compare to P75 or P90. Do not write “this issue has been open a long time” — be specific with numbers.
+
+ISSUE DATA: {structured\_issue\_and\_pr\_text}
+
+**Qwen Training / Inference System Prompt:**
+
+You are a bottleneck analyst for GitHub issues. Given an issue snapshot and its risk score, write a 2–3 sentence explanation for a non-technical scrum master. Reference specific signals. No bullet points.
+
+RISK\_SCORE: {score} | PROJECT: apache/airflow | P50=1d P75=5d P90=22d P95=44d | {structured\_issue\_and\_pr\_text}
+
+**Test labelling checks:**
+
+*   Every narrative must contain at least one number (days open, review count, comment gap, days since last review). Reject and re-label any that don’t.
+*   No narrative should start with “This issue” three times in a row across samples — check for templated openers and add diversity instruction if needed.
+*   Narratives for low-risk issues (score <0.3) should explain WHY the issue is low risk — not just describe it neutrally. Teaches the model to reason in both directions.
+*   Verify narrative length is 2–3 sentences — reject anything over 4 sentences or under 1. Check sentence count programmatically before adding to JSONL.
+
+## Model 3 — Planner
+
+No GPT-4o labelling. Ground truth comes from merged PR metadata. Training input is constructed field-by-field excluding all closure fields.
+
+**Training System Prompt + Input Format:**
+
+You are a senior software engineer planning a code patch for an open GitHub issue.
+
+ISSUE: {title} | LABELS: {labels} | ASSIGNEES: {assignee\_count} | BODY: {truncated\_body\_800t} | COMMENTS: {full\_comments} | REPO\_SYMBOLS: {treesitter\_index\_400t}
+
+First decide if a code change is needed. Then if yes, produce a structured patch plan.
+
+REQUIRES\_CODE\_CHANGE: YES | CONFIDENCE: HIGH | REASON: <one sentence> | PLAN: - Root cause: ... - Target files: ... - Target functions: ... - Test strategy: ...
+
+**Test training checks:**
+
+*   Validate all file paths in target files against the Tree-sitter index — any file path in the plan that does not exist in the repo at that commit is a hallucination. Log the hallucination rate across 20 samples; if >10% revisit the Tree-sitter index injection format.
+*   Check that REQUIRES\_CODE\_CHANGE: NO examples produce no PLAN section — if the model generates a plan after saying NO the output parser and loss weighting need adjustment.
+*   Spot-check that planned target functions exist in the named files using Tree-sitter — function-level hallucinations are harder to catch than file-level ones.
+*   Confirm no closed\_at, state\_reason, merged\_at or closed\_by appear anywhere in the training input strings — grep your JSONL file before training.
+
+## Model 4 — Patcher
+
+No GPT-4o labelling. Ground truth is the actual unified diff from the merged PR. Filter strictly to PRs with <6 files and <2500 patch tokens before building training pairs.
+
+**Training System Prompt + Input Format:**
+
+You are an expert software engineer generating a unified diff patch for an Apache Airflow codebase.
+
+PLAN: {planner\_output} | CODE\_SPANS: {treesitter\_extracted\_function\_blocks} | Generate a unified diff patch that implements the plan. Output only the diff, starting with --- a/ and nothing else.
+
+**Test training checks:**
+
+*   Run Tree-sitter re-parse on every generated diff in your sample run — any diff that breaks the syntax tree is a failure. Log the parse-failure rate. If >15% the model needs more training examples or a stricter output format constraint.
+*   Verify diff starts with --- a/ and has at least one @@ hunk — malformed diff output that doesn’t follow unified diff format is caught here before it reaches the Critic.
+*   Check that the diff only touches files named in the Planner’s target files list — if the model is hallucinating edits to unrelated files the Tree-sitter context injection needs to be more restrictive.
+*   For retry training examples (issue + prior diff + Critic feedback → revised diff): confirm the revised diff actually addresses the Critic’s stated concern — not just a superficially different diff.
+
+## Model 5 — Critic
+
+Partial GPT-4o labelling for PRs without review comments. Full ground truth from CHANGES\_REQUESTED reviews and inline review comments where available.
+
+**GPT-4o Labelling Prompt for synthetic Critic labels (temperature=0):**
+
+You are a senior code reviewer evaluating whether a proposed diff correctly addresses a GitHub issue.
+
+ISSUE: {title} | {truncated\_body} | PLAN: {plan} | DIFF (first hunk per file): {first\_hunk\_per\_file} | CI\_RESULT: {ci\_conclusion}
+
+Output exactly: ACCEPT, REVISE, or REJECT on the first line. Then 1–2 sentences of specific reasoning. ACCEPT if diff addresses issue and CI passes. REVISE if it partially addresses but has fixable gaps. REJECT if fundamentally wrong file or approach.
+
+**Training System Prompt + Input Format:**
+
+You are a code review critic. Given an issue, a patch plan, and a proposed diff, output ACCEPT, REVISE, or REJECT followed by 1–2 sentences of specific reasoning. ACCEPT if the diff addresses the issue. REVISE if fixable gaps exist. REJECT if fundamentally wrong.
+
+ISSUE: {title} | PLAN: {plan} | DIFF: {first\_hunk\_per\_file\_400t} | REVIEWS: {review\_bodies} | INLINE\_COMMENTS: {review\_comments} | CI: {ci\_conclusion}
+
+**Test training checks:**
+
+*   Output must begin with ACCEPT, REVISE, or REJECT — no other first token is valid. If any sample starts with a different word the NeMo guardrail or output parser will fail. Check all 20 samples before training.
+*   Check class distribution: if >70% of training labels are ACCEPT the model will default to ACCEPT. Target roughly 50% ACCEPT, 35% REVISE, 15% REJECT to reflect realistic review patterns.
+*   Verify that REVISE reasoning references a specific code concern (e.g. “missing null check”, “wrong function targeted”) not a vague statement like “needs improvement.” Re-label with stronger GPT-4o prompting if vague.
+*   For synthetic GPT-4o labels: check that CI\_RESULT=failure examples are not all being labelled ACCEPT — a CI failure with no explanation in reviews should at minimum produce REVISE.
+
+| 5B. Scorer Dataset Results, Class Imbalance Fix & Data Split |
+| --- |
+
+## 5B.1 Achieved Band Distribution (4,268 Total Records)
+
+After applying the Temporal Harvesting approach (anchors at Day 7, 15, 22, 29, 36, 44 with open-only filter and temporal masking), the CI failure signal (+0.15, pure failure only), and removing the no-PR flat signal (which caused medium band overshoot), the full labelling run on 4,268 records produced the following distribution:
+
+low 1,689 (39.6%)
+
+medium 1,914 (44.8%)
+
+high 665 (15.6%)
+
+This is a major improvement from the original distribution of 94.7% low / 5.0% medium / 0.3% high. The medium band is on target and the high band has grown from 36 examples to 665 genuine high-risk examples captured across the late anchors (T+29, T+36, T+44).
+
+## 5B.2 High Band Shortfall Fix — 3x Loss Weighting
+
+The high band has 665 examples against a target of ~1,330 (33% of 4,000). The shortfall is resolved during training using 3x loss weighting on high-band examples. This forces the model to pay three times more attention to getting high-risk predictions correct without duplicating data or distorting the label distribution.
+
+665 high-risk examples x 3x weight = 1,995 effective examples
+
+Exceeds the 1,330 target comfortably.
+
+Loss weight config: low=1.0, medium=1.5, high=3.0. Applied as per-sample weights in the training loop. Evaluate precision and recall per band separately — if low-risk precision drops below 0.70 reduce high weight to 2x; if high-risk recall is below 0.70 maintain at 3x or raise to 4x.
+
+## 5B.3 Data Split — 80/10/10 Issue-Level Stratified
+
+The dataset is split 80/10/10 (train/val/test) at the issue level, not the row level. Because the same issue appears at multiple anchors (e.g. #56011 at T+7, T+22, T+29, T+36, T+44), a row-level random split would place the same issue in both train and test — data leakage. Splitting on unique issue numbers ensures the model is evaluated only on issues it has never seen in any form during training. Stratification by dominant band (highest anchor band per issue) ensures each split preserves the overall band distribution.
+
+Actual split results (SEED=42):
+
+Train (3,400 rows): low 1,342 (39.5%) medium 1,522 (44.8%) high 536 (15.8%)
+
+Val ( 457 rows): low 184 (40.3%) medium 209 (45.7%) high 64 (14.0%)
+
+Test ( 411 rows): low 163 (39.7%) medium 183 (44.5%) high 65 (15.8%)
+
+Band percentages are consistent across all three splits confirming stratification worked correctly. No issue number appears in more than one split (verified by assert in split script). The test set is held out entirely until final model evaluation — do not use it for threshold tuning or prompt iteration.
+
+| 6. Training Configuration & Compute Budget |
+| --- |
+
+## 6.0 LoRA vs QLoRA — Decision for All 5 Models
+
+All 5 models use standard LoRA PEFT on bfloat16 base weights. QLoRA (4-bit NF4 quantized base) is not used.
+
+|  | Standard LoRA (chosen) | QLoRA (not used) |
+| --- | --- | --- |
+| Base model precision | bfloat16 (full) | 4-bit NF4 quantized |
+| VRAM for 7B base | ~14GB | ~4GB |
+| Gradient quality | Clean | Slight quantization noise |
+| Primary use case | When VRAM headroom exists | Memory-constrained GPUs (24GB RTX etc.) |
+| On A100 80GB | Correct choice — 66GB headroom after 7B load | Solves a problem you do not have |
+
+_Exception: if running all 5 models simultaneously on a single A100 for a live demo, the three Coder 7B adapters can be loaded in QLoRA to fit on one GPU. For training, always standard LoRA._
+
+## 6.1 Model 1 — Bottleneck Scorer (1.5B)
+
+| Parameter | Value | Reason |
+| --- | --- | --- |
+| Base model | Qwen2.5-1.5B-Instruct | Fast inference at 30-min polling cadence |
+| Task type | 5-class quantized (cross-entropy loss) | Preferred over MSE regression. Airflow’s skewed distribution (P50=1 day) causes MSE to learn to predict near the mean. Cross-entropy on 3 discrete bands handles score clustering cleanly. Bands: 0.0–0.35=Low, 0.35–0.65=Medium, 0.65–1.0=High. At inference: score = band midpoint giving floats 0.175 (Low) / 0.50 (Medium) / 0.825 (High). |
+| LoRA r | 16 | Sufficient for classification-style task |
+| LoRA alpha | 32 | Standard 2x ratio |
+| Target modules | q_proj, v_proj, k_proj, o_proj | All attention heads |
+| Epochs | 4 | Small model converges fast; watch for overfitting at epoch 5+ |
+| Batch size | 16 | Per A100 80GB |
+| Learning rate | 2e-4 | Standard LoRA LR |
+| Max seq length | 1536 tokens | Bumped from 1024. Active Airflow issues can have long descriptions and 10+ comments by T+14. Python truncation applied before tokenisation: body truncated first at 800 tokens, then comments trimmed oldest-first, preserving title, labels, PR status and most recent comments. |
+| Training samples | 3,000–4,000 balanced | Per Section 5.2 |
+| Estimated A100 time | 3–4 hours | Including eval runs |
+| Colab credits | ~4 |  |
+
+## 6.2 Model 2 — Bottleneck Reasoner (7B)
+
+| Parameter | Value | Reason |
+| --- | --- | --- |
+| Base model | Qwen2.5-7B-Instruct | Strong instruction following for narrative generation |
+| Task type | Causal LM / SFT | Text generation |
+| LoRA r | 32 | Richer adapter needed for narrative quality |
+| LoRA alpha | 64 | 2x ratio maintained |
+| Target modules | q_proj, v_proj, k_proj, o_proj, gate_proj, up_proj | Include FFN for generation tasks |
+| Epochs | 3 | Generation overfits faster than classification |
+| Batch size | 8 | 7B on A100 80GB with gradient checkpointing |
+| Learning rate | 1e-4 | Lower LR for generation stability |
+| Max seq length | 2048 tokens | Full issue + PR state + score fits comfortably |
+| Training samples | 2,000–3,000 | Reasoner needs fewer but higher quality examples |
+| Estimated A100 time | 10–14 hours | Including 2 eval runs |
+| Colab credits | ~14 |  |
+
+## 6.3 Models 3/4/5 — Planner, Patcher, Critic (3x LoRA on Coder 7B)
+
+| Parameter | Planner | Patcher | Critic |
+| --- | --- | --- | --- |
+| Base model | Qwen2.5-Coder-7B-Instruct | Qwen2.5-Coder-7B-Instruct | Qwen2.5-Coder-7B-Instruct |
+| LoRA r | 32 | 64 | 32 |
+| LoRA alpha | 64 | 128 | 64 |
+| Epochs | 3 | 4 | 3 |
+| Batch size | 8 | 4 (long context) | 8 |
+| Max seq length | 2048 | 3072 (diff + spans) | 2048 |
+| LR | 1e-4 | 5e-5 | 1e-4 |
+| Training samples | 3,000 (2,700 YES + 300 NO, 2.5x loss weight on NO) | 2,500 | 2,500 |
+| A100 hours | 10–12 | 14–18 | 10–12 |
+| Colab credits | ~12 | ~16 | ~12 |
+
+**Parameter justifications:**
+
+*   LoRA r — Patcher uses r=64 vs r=32 for Planner and Critic. Patcher must learn precise token-level code generation including exact syntax, indentation, and diff formatting. Higher rank gives it more expressive capacity to capture these fine-grained patterns. Planner and Critic produce structured text and classifications respectively — r=32 is sufficient.
+*   LoRA alpha — Always 2x the r value for all three. This is the standard scaling ratio that keeps the LoRA update magnitude stable relative to the base model weights. Changing this ratio without a specific reason introduces instability.
+*   Epochs — Patcher trains for 4 epochs vs 3 for Planner and Critic. Code generation overfits more slowly than structured text output because the output space (valid diffs) is much larger and more diverse. Planner and Critic have more constrained outputs and converge faster.
+*   Batch size — Patcher uses batch size 4 vs 8 for Planner and Critic because its max sequence length is 3072 tokens (diff + code spans) vs 2048 for the others. Larger sequences consume proportionally more VRAM per example. Halving the batch size keeps memory usage within A100 bounds without gradient checkpointing overhead.
+*   Max seq length — Patcher needs 3072 to fit the full function span context plus the unified diff target in a single sequence. Planner and Critic work with issue text, comments, and structured outputs that fit comfortably in 2048. Unnecessarily extending seq length for Planner and Critic would waste VRAM and slow training.
+*   Learning rate — Patcher uses 5e-5 vs 1e-4 for Planner and Critic. Lower LR for the Patcher because code generation is more sensitive to large gradient steps — an aggressive update can cause the model to produce syntactically broken diffs that never recover. Planner and Critic produce more forgiving text outputs where 1e-4 converges cleanly.
+
+## 6.4 Total Compute Budget
+
+| Task | A100 Hours | Colab Credits |
+| --- | --- | --- |
+| ETL + labelling prep (CPU/low GPU) | 4–6 | 4 |
+| Model 1: training + 2 eval runs | 6–8 | 8 |
+| Model 2: training + 2 eval runs | 14–18 | 18 |
+| Planner: training + eval | 12–14 | 14 |
+| Patcher: training + eval | 16–20 | 20 |
+| Critic: training + eval | 12–14 | 14 |
+| Re-runs / iteration buffer | 20–30 | 30 |
+| TOTAL | ~84–110 hours | ~108 credits (of 350 available) |
+
+Remaining ~240 Colab credits and 300 GCP Vertex credits are available for deployment, serving, and any additional fine-tuning iterations.
+
+| 7. Guardrails & Safety |
+| --- |
+
+## 7.1 NeMo Guardrails — Per Model
+
+| Model | Guardrail Type | What it enforces |
+| --- | --- | --- |
+| Scorer (1.5B) | Output schema | Force output to be a float between 0.0 and 1.0. Block any text output. Re-run if out of range. |
+| Reasoner (7B) | Topic + format | Block outputs that don't reference the issue. Enforce 2–3 sentence limit. Block lists/bullets. Block hallucinated PR numbers. |
+| Planner | Hallucination | Validate all file paths cited in the plan against Tree-sitter index. Reject plan if files don't exist in the repo. |
+| Patcher | Structural | Re-parse proposed diff with Tree-sitter after generation. Reject if syntax tree breaks. Block changes outside allowed file paths. |
+| Critic | Output schema | Force ACCEPT/REVISE/REJECT as first token. Block free-form responses that don't start with one of these three. |
+
+## 7.2 NemoClaw / OpenShell Sandbox (VSCode Plugin)
+
+*   Filesystem allowlist: only repo root and subdirectories — no writes outside project
+*   Network policy: only GitHub API endpoints allowed. All other outbound blocked.
+*   Process restrictions: no privilege escalation, no shell commands outside pre-approved list (pytest, flake8, git)
+*   Token redaction: GitHub tokens and secrets stripped from any context passed to model
+*   Patch application always on a new sandbox branch — never directly on main or user's current branch
+
+## 7.3 Training Data Guardrails
+
+*   Strip all closure signals before training snapshot: closed\_at, resolution\_days, 'closing #', 'merged', 'LGTM', 'fixed in', 'resolved by'
+*   Validate that no example contains future-dated information relative to its T+N snapshot cutoff
+*   Reject any Patcher training example where pr\_files\[\].patch contains binary files or > 500 line diffs
+*   Reject any Critic training example where no review comment or CI result exists (insufficient supervision)
+
+| 8. Approximate 3-Week Delivery Timeline |
+| --- |
+| Week | Days | Task | Deliverable |
+| --- | --- | --- | --- |
+| Week 1 | 1–2 | ETL pipeline: pull all Airflow issues and PRs, compute project stats, build T+14 snapshots | Raw dataset ~12K examples |
+| Week 1 | 3–4 | Programmatic scoring, GPT-4o teacher labelling (Models 1+2+Critic) | Labelled dataset, balanced to 3–4K examples |
+| Week 1 | 5 | Tree-sitter repo index build, Patcher/Planner target extraction (PR diffs + symbol spans) | Planner/Patcher/Critic training sets |
+| Week 2 | 6–8 | Train Model 1 (Scorer) + eval + threshold calibration | Model 1 LoRA adapter, eval metrics |
+| Week 2 | 9–10 | Train Model 2 (Reasoner) + eval + narrative quality review | Model 2 LoRA adapter |
+| Week 2 | 11–12 | Train Planner + Patcher adapters | Adapters 1 and 2 |
+| Week 3 | 13–14 | Train Critic adapter + autoresearch loop integration | Adapter 3 + validated loop |
+| Week 3 | 15–16 | Slack orchestrator + GitHub MCP integration + NeMo guardrail config | Feature 1 live end-to-end |
+| Week 3 | 17–19 | VSCode plugin + Tree-sitter live integration + NemoClaw sandbox | Feature 2 working demo |
+| Week 3 | 20–21 | End-to-end testing, threshold tuning, demo prep | Deliverable system |
+
+_Total: ~21 working days. Tight but achievable if ETL is unblocked in week 1. The biggest risk is ETL + labelling taking longer than expected — start that immediately._

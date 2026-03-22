@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { PatchSession } from "./session";
 
 const SECTION = "autobot";
 
@@ -16,12 +17,17 @@ export interface AutobotRepoIndexConfig {
   maxDepth: number;
 }
 
-export function getGitHubOwnerRepo(): { owner: string; repo: string } {
+/**
+ * Resolves GitHub owner/repo: deep-link overrides (session) win, then workspace settings.
+ */
+export function getGitHubOwnerRepo(session?: PatchSession): { owner: string; repo: string } {
   const c = vscode.workspace.getConfiguration(SECTION);
-  return {
-    owner: c.get<string>("github.owner", "apache"),
-    repo: c.get<string>("github.repo", "airflow"),
-  };
+  const ownerDefault = c.get<string>("github.owner", "apache");
+  const repoDefault = c.get<string>("github.repo", "airflow");
+  if (session?.githubOwner && session?.githubRepo) {
+    return { owner: session.githubOwner, repo: session.githubRepo };
+  }
+  return { owner: ownerDefault, repo: repoDefault };
 }
 
 export function getInferenceConfig(): AutobotInferenceConfig {

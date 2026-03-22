@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { getGitHubOwnerRepo, getInferenceConfig, getMaxCriticIterations, getRepoIndexConfig } from "./config";
+import { buildAutobotDeepLink, type ParsedDeepLink } from "./deepLink";
 import { GitHubRestClient } from "./githubRest";
 import { InferenceClient } from "./inferenceClient";
 import { parseCriticOutput, parsePlannerOutput } from "./parsers";
@@ -37,11 +38,40 @@ export async function openIssueInteractive(session: PatchSession): Promise<void>
     return;
   }
   session.issueNumber = parseInt(input.trim(), 10);
+  session.githubOwner = undefined;
+  session.githubRepo = undefined;
   session.bundle = undefined;
   session.plannerRaw = undefined;
   session.patcherRaw = undefined;
   session.lastCritic = undefined;
   vscode.window.showInformationMessage(`AutoBot: active issue #${session.issueNumber}`);
+}
+
+/** Apply Slack / browser deep link: set issue (+ optional owner/repo) and optionally fetch from GitHub. */
+export async function openIssueFromDeepLink(
+  session: PatchSession,
+  parsed: ParsedDeepLink,
+  secrets: vscode.SecretStorage,
+  out: vscode.OutputChannel
+): Promise<void> {
+  session.issueNumber = parsed.issue;
+  if (parsed.owner && parsed.repo) {
+    session.githubOwner = parsed.owner;
+    session.githubRepo = parsed.repo;
+  } else {
+    session.githubOwner = undefined;
+    session.githubRepo = undefined;
+  }
+  session.bundle = undefined;
+  session.plannerRaw = undefined;
+  session.patcherRaw = undefined;
+  session.lastCritic = undefined;
+  const scope =
+    parsed.owner && parsed.repo ? ` (${parsed.owner}/${parsed.repo})` : "";
+  vscode.window.showInformationMessage(`AutoBot: active issue #${session.issueNumber}${scope}`);
+  if (parsed.autoFetch) {
+    await fetchIssue(session, secrets, out);
+  }
 }
 
 export async function fetchIssue(
@@ -56,7 +86,7 @@ export async function fetchIssue(
     return;
   }
   const token = await ensureGitHubToken(secrets);
-  const { owner, repo } = getGitHubOwnerRepo();
+  const { owner, repo } = getGitHubOwnerRepo(session);
   const gh = new GitHubRestClient(token, owner, repo);
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `Fetching issue #${session.issueNumber}` },
@@ -232,6 +262,23 @@ export async function runFullLoop(
     }
   }
   vscode.window.showInformationMessage("AutoBot: patch loop finished (see output channel).");
+}
+
+/** Copy `vscode://…/open?…` for Slack buttons (uses workspace owner/repo + active issue). */
+export async function copyOpenInEditorDeepLink(session: PatchSession): Promise<void> {
+  if (!session.issueNumber) {
+    vscode.window.showWarningMessage("Set an active issue first (Open Issue or deep link).");
+    return;
+  }
+  const { owner, repo } = getGitHubOwnerRepo(session);
+  const link = buildAutobotDeepLink(session.issueNumber, {
+    owner,
+    repo,
+    autoFetch: true,
+    uriScheme: vscode.env.uriScheme,
+  });
+  await vscode.env.clipboard.writeText(link);
+  vscode.window.showInformationMessage("AutoBot: Open-in-editor link copied to clipboard.");
 }
 
 export async function showRepoIndex(out: vscode.OutputChannel): Promise<void> {

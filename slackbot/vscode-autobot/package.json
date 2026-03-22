@@ -11,6 +11,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onUri",
     "onCommand:autobot.openIssue",
     "onCommand:autobot.fetchIssue",
     "onCommand:autobot.runPlanner",
@@ -19,6 +20,7 @@
     "onCommand:autobot.runPatchLoop",
     "onCommand:autobot.setGitHubToken",
     "onCommand:autobot.showRepoIndex",
+    "onCommand:autobot.copyOpenLink",
     "onView:autobot.patchView"
   ],
   "main": "./out/extension.js",
@@ -55,6 +57,10 @@
       {
         "command": "autobot.showRepoIndex",
         "title": "AutoBot: Show Compact Repo Index"
+      },
+      {
+        "command": "autobot.copyOpenLink",
+        "title": "AutoBot: Copy Open-in-Editor Link (for Slack)"
       }
     ],
     "views": {
