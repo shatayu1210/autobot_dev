@@ -196,6 +196,7 @@ patcher = Agent(
     - Does not introduce syntax errors in the modified code
     """,
     tools=[call_patcher_endpoint, validate_diff_syntax, read_file_content],
+    max_llm_calls=3,
 )
 
 root_agent = patcher

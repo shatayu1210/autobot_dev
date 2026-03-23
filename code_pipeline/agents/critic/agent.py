@@ -164,6 +164,7 @@ critic = Agent(
     """,
     output_schema=CriticVerdict,
     tools=[call_critic_endpoint],
+    max_llm_calls=3,
     # Disallow transfers as it uses output_schema
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,

@@ -241,9 +241,9 @@ planner = Agent(
 
     **Workflow:**
     1. Use `fetch_issue` to retrieve the full issue details (title, body, labels, comments, timeline).
-    2. Use `build_repo_index` to create a Tree-sitter index of the target repository.
-    3. Use `get_code_spans` with the issue text and repo index to find relevant code locations.
-    4. Use `call_planner_endpoint` with a formatted prompt to generate the structured plan.
+    2. SKIP `build_repo_index` and `get_code_spans` — no local repo clone is available, these tools
+       will fail. Set RELEVANT_CODE_SPANS to "N/A" in the prompt.
+    3. Use `call_planner_endpoint` with a formatted prompt to generate the structured plan.
 
     **Planning Prompt Format (for call_planner_endpoint):**
     Construct the prompt as:
@@ -275,6 +275,7 @@ planner = Agent(
     Always validate that file paths in your plan exist in the repo index.
     """,
     tools=[fetch_issue, build_repo_index, get_code_spans, call_planner_endpoint],
+    max_llm_calls=3,
 )
 
 root_agent = planner

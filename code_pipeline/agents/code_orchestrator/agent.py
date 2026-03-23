@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from typing import AsyncGenerator
 from google.adk.agents import BaseAgent, LoopAgent, SequentialAgent
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
@@ -12,17 +13,17 @@ from traced_authenticated_httpx import create_traced_authenticated_client  # typ
 
 # --- Callbacks ---
 
-def create_save_output_callback(key: str):
-    """Creates a callback to save the agent's final response to session state.
+_agent_start_times: dict = {}
 
-    For the critic agent, attempts to parse the output as JSON to extract
-    the structured CriticVerdict (verdict + feedback). For other agents,
-    saves the raw text output.
-    """
+
+def create_save_output_callback(key: str):
+    """Creates a callback to save the agent's final response to session state."""
     def callback(callback_context: CallbackContext, **kwargs) -> None:
         ctx = callback_context
+        agent = ctx.agent_name
+        elapsed = time.time() - _agent_start_times.pop(agent, time.time())
         for event in reversed(ctx.session.events):
-            if event.author == ctx.agent_name and event.content and event.content.parts:
+            if event.author == agent and event.content and event.content.parts:
                 text = event.content.parts[0].text
                 if text:
                     if key == "critic_verdict" and text.strip().startswith("{"):
@@ -32,8 +33,17 @@ def create_save_output_callback(key: str):
                             ctx.state[key] = text
                     else:
                         ctx.state[key] = text
-                    print(f"[{ctx.agent_name}] Saved output to state['{key}']")
+                    print(f"[TIMER] {agent} finished in {elapsed:.1f}s → saved to state['{key}']")
                     return
+        print(f"[TIMER] {agent} finished in {elapsed:.1f}s → no text output captured")
+    return callback
+
+
+def create_before_callback(agent_name: str):
+    """Records start time before each agent runs."""
+    def callback(callback_context: CallbackContext, **kwargs) -> None:
+        _agent_start_times[agent_name] = time.time()
+        print(f"[TIMER] {agent_name} starting...")
     return callback
 
 
@@ -48,6 +58,7 @@ planner = RemoteA2aAgent(
     name="planner",
     agent_card=planner_url,
     description="Analyzes GitHub issues and generates structured patch plans.",
+    before_agent_callback=create_before_callback("planner"),
     after_agent_callback=create_save_output_callback("patch_plan"),
     httpx_client=create_traced_authenticated_client(planner_url),
 )
@@ -61,6 +72,7 @@ patcher = RemoteA2aAgent(
     name="patcher",
     agent_card=patcher_url,
     description="Generates unified diffs from structured plans.",
+    before_agent_callback=create_before_callback("patcher"),
     after_agent_callback=create_save_output_callback("patch_diff"),
     httpx_client=create_traced_authenticated_client(patcher_url),
 )
@@ -74,6 +86,7 @@ critic = RemoteA2aAgent(
     name="critic",
     agent_card=critic_url,
     description="Evaluates diffs and returns ACCEPT/REVISE/REJECT verdict.",
+    before_agent_callback=create_before_callback("critic"),
     after_agent_callback=create_save_output_callback("critic_verdict"),
     httpx_client=create_traced_authenticated_client(critic_url),
 )

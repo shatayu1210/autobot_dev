@@ -186,50 +186,69 @@ async def chat_stream(request: SimpleChatRequest):
 
         patch_output_text = ""
         all_text_by_author: dict = {}
-
-        # Wrap the async generator so we can read it with a timeout for heartbeats.
-        # Cloud Shell's proxy buffers streaming responses unless we keep sending data;
-        # heartbeat chunks (ignored by the frontend) prevent idle-timeout disconnects.
-        events_iter = events.__aiter__()
         HEARTBEAT_INTERVAL = 10  # seconds
 
-        while True:
+        # Use a Queue + background task so the SSE connection to the orchestrator
+        # is never cancelled by a timeout. The timeout only fires on queue.get(),
+        # which lets us send keepalive chunks without disturbing the httpx stream.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _consume():
             try:
-                event = await asyncio.wait_for(events_iter.__anext__(), timeout=HEARTBEAT_INTERVAL)
-            except asyncio.TimeoutError:
-                # Pipeline still running — send a keepalive so the proxy doesn't close the connection
-                yield json.dumps({"type": "heartbeat"}) + "\n"
-                continue
-            except StopAsyncIteration:
-                break
+                async for event in events:
+                    await queue.put(event)
+            except Exception as e:
+                logger.error(f"[_consume] SSE read error: {e}")
+            finally:
+                await queue.put(None)  # sentinel: pipeline finished
 
-            author = event.get("author", "")
-            logger.info(f"[event_generator] author={author!r} has_content={bool(event.get('content'))}")
+        consumer_task = asyncio.create_task(_consume())
 
-            # Send progress update for each agent turn
-            if author == "planner":
-                yield json.dumps({"type": "progress", "text": "Planner is analyzing the issue and building a patch plan..."}) + "\n"
-            elif author == "patcher":
-                yield json.dumps({"type": "progress", "text": "Patcher is generating the unified diff..."}) + "\n"
-            elif author == "critic":
-                yield json.dumps({"type": "progress", "text": "Critic is evaluating the diff..."}) + "\n"
-            elif author == "verdict_checker":
-                yield json.dumps({"type": "progress", "text": "Checking verdict..."}) + "\n"
-            elif author == "patch_output":
-                yield json.dumps({"type": "progress", "text": "Finalizing result..."}) + "\n"
-
-            # Extract text content
-            if "content" in event and event["content"]:
+        try:
+            while True:
                 try:
-                    content = genai_types.Content.model_validate(event["content"])
-                    for part in content.parts or []:  # type: ignore
-                        if part.text and part.text.strip():
-                            all_text_by_author.setdefault(author, "")
-                            all_text_by_author[author] += part.text
-                            if author == "patch_output":
-                                patch_output_text += part.text
-                except Exception as e:
-                    logger.warning(f"[event_generator] Could not parse content for author={author}: {e}")
+                    event = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL)
+                except asyncio.TimeoutError:
+                    # No event arrived — pipeline still running; send keepalive
+                    yield json.dumps({"type": "heartbeat"}) + "\n"
+                    continue
+
+                if event is None:  # sentinel
+                    break
+
+                author = event.get("author", "")
+                logger.info(f"[event_generator] author={author!r} has_content={bool(event.get('content'))}")
+
+                # Progress updates
+                if author == "planner":
+                    yield json.dumps({"type": "progress", "text": "Planner is analyzing the issue and building a patch plan..."}) + "\n"
+                elif author == "patcher":
+                    yield json.dumps({"type": "progress", "text": "Patcher is generating the unified diff..."}) + "\n"
+                elif author == "critic":
+                    yield json.dumps({"type": "progress", "text": "Critic is evaluating the diff..."}) + "\n"
+                elif author == "verdict_checker":
+                    yield json.dumps({"type": "progress", "text": "Checking verdict..."}) + "\n"
+                elif author == "patch_output":
+                    yield json.dumps({"type": "progress", "text": "Finalizing result..."}) + "\n"
+
+                # Extract text content
+                if "content" in event and event["content"]:
+                    try:
+                        content = genai_types.Content.model_validate(event["content"])
+                        for part in content.parts or []:  # type: ignore
+                            if part.text and part.text.strip():
+                                all_text_by_author.setdefault(author, "")
+                                all_text_by_author[author] += part.text
+                                if author == "patch_output":
+                                    patch_output_text += part.text
+                    except Exception as e:
+                        logger.warning(f"[event_generator] Could not parse content for author={author}: {e}")
+        finally:
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                pass
 
         # Prefer patch_output's formatted result; fall back to last agent with text
         result_text = patch_output_text.strip()
