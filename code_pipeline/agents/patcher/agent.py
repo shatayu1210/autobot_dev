@@ -166,14 +166,14 @@ patcher = Agent(
     **Patching Prompt Format (for call_patcher_endpoint):**
 ```
     PLAN:
-    {structured plan from planner}
+    {{structured plan from planner}}
 
     SOURCE FILES:
-    === {file_path_1} ===
-    {file content}
+    === {{file_path_1}} ===
+    {{file content}}
 
-    === {file_path_2} ===
-    {file content}
+    === {{file_path_2}} ===
+    {{file content}}
 
     TASK: Generate a unified diff that implements the plan above.
     Output ONLY the unified diff in standard `git diff` format.

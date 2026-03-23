@@ -9,6 +9,7 @@ CODER_ENDPOINT_ID = os.environ.get("CODER_ENDPOINT_ID", "")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "")
 GCP_REGION = os.environ.get("GCP_REGION", "us-central1")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 VERTEX_PREDICT_URL = (
     f"https://{GCP_REGION}-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT}"
@@ -44,7 +45,7 @@ async def _call_gemini_fallback(prompt: str, max_tokens: int = 2048) -> str:
 # --- Tools ---
 
 def fetch_issue(owner: str, repo: str, issue_number: int) -> dict:
-    """Fetches issue details from the GitHub MCP server.
+    """Fetches issue details directly from the GitHub REST API.
 
     Args:
         owner: The GitHub repository owner.
@@ -54,21 +55,27 @@ def fetch_issue(owner: str, repo: str, issue_number: int) -> dict:
     Returns:
         A dictionary containing the issue title, body, labels, comments, and timeline.
     """
-    base = MCP_SERVER_URL.rstrip("/")
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+    base = f"https://api.github.com/repos/{owner}/{repo}"
     try:
         issue_resp = httpx.get(
-            f"{base}/repos/{owner}/{repo}/issues/{issue_number}", timeout=30
+            f"{base}/issues/{issue_number}", headers=headers, timeout=30
         )
         issue_resp.raise_for_status()
         issue_data = issue_resp.json()
 
         comments_resp = httpx.get(
-            f"{base}/repos/{owner}/{repo}/issues/{issue_number}/comments", timeout=30
+            f"{base}/issues/{issue_number}/comments", headers=headers, timeout=30
         )
         comments = comments_resp.json() if comments_resp.status_code == 200 else []
 
         timeline_resp = httpx.get(
-            f"{base}/repos/{owner}/{repo}/issues/{issue_number}/timeline", timeout=30
+            f"{base}/issues/{issue_number}/timeline",
+            headers={**headers, "Accept": "application/vnd.github.mockingbird-preview+json"},
+            timeout=30,
         )
         timeline = timeline_resp.json() if timeline_resp.status_code == 200 else []
 
@@ -241,13 +248,13 @@ planner = Agent(
     **Planning Prompt Format (for call_planner_endpoint):**
     Construct the prompt as:
     ```
-    ISSUE_TITLE: {title}
-    ISSUE_BODY: {body}
-    ISSUE_LABELS: {labels}
-    DISCUSSION: {comments summary}
+    ISSUE_TITLE: {{title}}
+    ISSUE_BODY: {{body}}
+    ISSUE_LABELS: {{labels}}
+    DISCUSSION: {{comments summary}}
 
     RELEVANT_CODE_SPANS:
-    {code spans from get_code_spans}
+    {{code spans from get_code_spans}}
 
     TASK: Generate a structured patch plan. For each file that needs changes:
     - File path (must exist in the repo index)

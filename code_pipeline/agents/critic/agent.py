@@ -133,14 +133,14 @@ critic = Agent(
 
     **Critique Prompt Format (for call_critic_endpoint):**
 ```
-    ISSUE_TITLE: {title}
-    ISSUE_BODY: {body}
+    ISSUE_TITLE: {{title}}
+    ISSUE_BODY: {{body}}
 
     PLAN:
-    {structured plan}
+    {{structured plan}}
 
     DIFF:
-    {unified diff}
+    {{unified diff}}
 
     TASK: Evaluate this diff. Your first word MUST be one of: ACCEPT, REVISE, or REJECT.
     Then provide your reasoning.
