@@ -13,7 +13,8 @@ dependencies = [
     "opentelemetry-instrumentation-google-genai>=0.3b0, <1.0.0",
     "python-dotenv",
     "httpx>=0.28.0",
-    "google-auth>=2.0.0"
+    "google-auth>=2.0.0",
+    "google-genai"
 ]
 
 [[tool.uv.index]]

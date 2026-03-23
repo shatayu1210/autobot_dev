@@ -2,6 +2,7 @@ import os
 import json
 import httpx
 from google.adk.agents import Agent
+from google import genai
 
 # --- Configuration ---
 CODER_ENDPOINT_ID = os.environ.get("CODER_ENDPOINT_ID", "")
@@ -15,6 +16,29 @@ VERTEX_PREDICT_URL = (
 )
 
 MODEL = "gemini-3-flash-preview"
+FALLBACK_MODEL = "gemini-2.0-flash"
+
+
+# --- Fallback ---
+
+async def _call_gemini_fallback(prompt: str, max_tokens: int = 2048) -> str:
+    """Fallback: calls Gemini when the Vertex AI vLLM endpoint is unavailable."""
+    try:
+        client = genai.Client()
+        response = client.models.generate_content(
+            model=FALLBACK_MODEL,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.2,
+            ),
+        )
+        return response.text
+    except Exception as fallback_err:
+        return (
+            f"Error: Both primary endpoint and Gemini fallback failed. "
+            f"Fallback error: {str(fallback_err)}"
+        )
 
 
 # --- Tools ---
@@ -195,7 +219,8 @@ async def call_planner_endpoint(prompt: str) -> str:
                 return choices[0].get("text", "")
             return json.dumps(result)
     except Exception as e:
-        return f"Error calling planner endpoint: {str(e)}"
+        print(f"[Planner] Primary endpoint failed: {e}. Falling back to Gemini.")
+        return await _call_gemini_fallback(prompt, max_tokens=2048)
 
 
 # --- Planner Agent ---

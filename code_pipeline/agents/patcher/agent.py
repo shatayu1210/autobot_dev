@@ -2,6 +2,7 @@ import os
 import json
 import httpx
 from google.adk.agents import Agent
+from google import genai
 
 # --- Configuration ---
 CODER_ENDPOINT_ID = os.environ.get("CODER_ENDPOINT_ID", "")
@@ -14,6 +15,29 @@ VERTEX_PREDICT_URL = (
 )
 
 MODEL = "gemini-3-flash-preview"
+FALLBACK_MODEL = "gemini-2.0-flash"
+
+
+# --- Fallback ---
+
+async def _call_gemini_fallback(prompt: str, max_tokens: int = 4096) -> str:
+    """Fallback: calls Gemini when the Vertex AI vLLM endpoint is unavailable."""
+    try:
+        client = genai.Client()
+        response = client.models.generate_content(
+            model=FALLBACK_MODEL,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.1,
+            ),
+        )
+        return response.text
+    except Exception as fallback_err:
+        return (
+            f"Error: Both primary endpoint and Gemini fallback failed. "
+            f"Fallback error: {str(fallback_err)}"
+        )
 
 
 # --- Tools ---
@@ -23,6 +47,7 @@ async def call_patcher_endpoint(prompt: str) -> str:
 
     Sends the patching prompt to the base Qwen2.5-Coder-7B-Instruct model
     to generate a unified diff from the plan and code spans.
+    Falls back to Gemini if the primary endpoint is unavailable.
 
     Args:
         prompt: The formatted patching prompt including the plan and code context.
@@ -64,7 +89,8 @@ async def call_patcher_endpoint(prompt: str) -> str:
                 return choices[0].get("text", "")
             return json.dumps(result)
     except Exception as e:
-        return f"Error calling patcher endpoint: {str(e)}"
+        print(f"[Patcher] Primary endpoint failed: {e}. Falling back to Gemini.")
+        return await _call_gemini_fallback(prompt, max_tokens=4096)
 
 
 def validate_diff_syntax(diff_text: str) -> str:
@@ -138,7 +164,7 @@ patcher = Agent(
     4. Use `validate_diff_syntax` to verify the diff is structurally valid.
 
     **Patching Prompt Format (for call_patcher_endpoint):**
-    ```
+```
     PLAN:
     {structured plan from planner}
 
@@ -153,7 +179,7 @@ patcher = Agent(
     Output ONLY the unified diff in standard `git diff` format.
     Each file change should have proper --- / +++ headers and @@ hunk headers.
     Do NOT include any explanation outside the diff.
-    ```
+```
 
     **Output Format:**
     Return ONLY the unified diff. No preamble, no explanation, just the diff.

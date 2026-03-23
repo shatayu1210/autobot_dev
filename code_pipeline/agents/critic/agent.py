@@ -3,6 +3,7 @@ import json
 import httpx
 from typing import Literal
 from google.adk.agents import Agent
+from google import genai
 from pydantic import BaseModel, Field
 
 # --- Configuration ---
@@ -16,6 +17,7 @@ VERTEX_PREDICT_URL = (
 )
 
 MODEL = "gemini-3-flash-preview"
+FALLBACK_MODEL = "gemini-2.0-flash"
 
 
 # --- Data Models ---
@@ -40,6 +42,28 @@ class CriticVerdict(BaseModel):
     )
 
 
+# --- Fallback ---
+
+async def _call_gemini_fallback(prompt: str, max_tokens: int = 1024) -> str:
+    """Fallback: calls Gemini when the Vertex AI vLLM endpoint is unavailable."""
+    try:
+        client = genai.Client()
+        response = client.models.generate_content(
+            model=FALLBACK_MODEL,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.1,
+            ),
+        )
+        return response.text
+    except Exception as fallback_err:
+        return (
+            f"Error: Both primary endpoint and Gemini fallback failed. "
+            f"Fallback error: {str(fallback_err)}"
+        )
+
+
 # --- Tools ---
 
 async def call_critic_endpoint(prompt: str) -> str:
@@ -47,6 +71,7 @@ async def call_critic_endpoint(prompt: str) -> str:
 
     Sends the critique prompt to the vLLM-served Qwen2.5-Coder-7B-Instruct
     model with the critic LoRA adapter for diff evaluation.
+    Falls back to Gemini if the primary endpoint is unavailable.
 
     Args:
         prompt: The formatted critique prompt including issue, plan, and diff.
@@ -88,7 +113,8 @@ async def call_critic_endpoint(prompt: str) -> str:
                 return choices[0].get("text", "")
             return json.dumps(result)
     except Exception as e:
-        return f"Error calling critic endpoint: {str(e)}"
+        print(f"[Critic] Primary endpoint failed: {e}. Falling back to Gemini.")
+        return await _call_gemini_fallback(prompt, max_tokens=1024)
 
 
 # --- Critic Agent ---
@@ -106,7 +132,7 @@ critic = Agent(
     3. Parse the model output and return a structured verdict.
 
     **Critique Prompt Format (for call_critic_endpoint):**
-    ```
+```
     ISSUE_TITLE: {title}
     ISSUE_BODY: {body}
 
@@ -122,7 +148,7 @@ critic = Agent(
     ACCEPT: The diff correctly implements the plan, handles edge cases, and is ready for testing.
     REVISE: The diff has specific issues that can be fixed (list them).
     REJECT: The diff is fundamentally wrong — the plan itself may need to change.
-    ```
+```
 
     **Decision Criteria:**
     - ACCEPT: Diff matches plan, no syntax issues, edge cases handled, tests likely to pass.
