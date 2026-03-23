@@ -182,16 +182,31 @@ async def chat_stream(request: SimpleChatRequest):
     )
 
     async def event_generator():
-        # Only capture the patch_output agent's text — it produces the final formatted result.
-        # All other agents' text (plan, diff, critic) is embedded inside patch_output's message.
+        import asyncio
+
         patch_output_text = ""
         all_text_by_author: dict = {}
 
-        async for event in events:
-            author = event.get("author", "")
-            logger.info(f"[event_generator] author={author!r} has_content={'content' in event and bool(event.get('content'))}")
+        # Wrap the async generator so we can read it with a timeout for heartbeats.
+        # Cloud Shell's proxy buffers streaming responses unless we keep sending data;
+        # heartbeat chunks (ignored by the frontend) prevent idle-timeout disconnects.
+        events_iter = events.__aiter__()
+        HEARTBEAT_INTERVAL = 10  # seconds
 
-            # Send progress updates
+        while True:
+            try:
+                event = await asyncio.wait_for(events_iter.__anext__(), timeout=HEARTBEAT_INTERVAL)
+            except asyncio.TimeoutError:
+                # Pipeline still running — send a keepalive so the proxy doesn't close the connection
+                yield json.dumps({"type": "heartbeat"}) + "\n"
+                continue
+            except StopAsyncIteration:
+                break
+
+            author = event.get("author", "")
+            logger.info(f"[event_generator] author={author!r} has_content={bool(event.get('content'))}")
+
+            # Send progress update for each agent turn
             if author == "planner":
                 yield json.dumps({"type": "progress", "text": "Planner is analyzing the issue and building a patch plan..."}) + "\n"
             elif author == "patcher":
@@ -203,7 +218,7 @@ async def chat_stream(request: SimpleChatRequest):
             elif author == "patch_output":
                 yield json.dumps({"type": "progress", "text": "Finalizing result..."}) + "\n"
 
-            # Extract text from this event
+            # Extract text content
             if "content" in event and event["content"]:
                 try:
                     content = genai_types.Content.model_validate(event["content"])
@@ -211,30 +226,36 @@ async def chat_stream(request: SimpleChatRequest):
                         if part.text and part.text.strip():
                             all_text_by_author.setdefault(author, "")
                             all_text_by_author[author] += part.text
-                            # Capture patch_output separately — this is the final formatted result
                             if author == "patch_output":
                                 patch_output_text += part.text
                 except Exception as e:
                     logger.warning(f"[event_generator] Could not parse content for author={author}: {e}")
 
-        # Prefer patch_output's text; fall back to the last non-empty agent's text
+        # Prefer patch_output's formatted result; fall back to last agent with text
         result_text = patch_output_text.strip()
         if not result_text and all_text_by_author:
-            # Use the last agent that produced text
-            for author in reversed(list(all_text_by_author.keys())):
-                candidate = all_text_by_author[author].strip()
+            for a in reversed(list(all_text_by_author.keys())):
+                candidate = all_text_by_author[a].strip()
                 if candidate:
                     result_text = candidate
-                    logger.warning(f"[event_generator] patch_output empty; using text from author={author!r}")
+                    logger.warning(f"[event_generator] patch_output empty; using text from author={a!r}")
                     break
 
         if not result_text:
-            result_text = "Pipeline completed but produced no output. Check the server logs for details."
+            result_text = "Pipeline completed but produced no output. Check server logs."
 
         logger.info(f"[event_generator] Sending result ({len(result_text)} chars), authors seen: {list(all_text_by_author.keys())}")
         yield json.dumps({"type": "result", "text": result_text}) + "\n"
 
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",   # Disables nginx/Cloud Shell proxy buffering
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 # Mount frontend from the copied location
 frontend_path = os.path.join(os.path.dirname(__file__), "frontend")
