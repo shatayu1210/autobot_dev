@@ -1,0 +1,5 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'gcr.io/autobot-demo-2/mcp-server', '-f', 'Dockerfile.mcp', '.']
+images:
+- 'gcr.io/autobot-demo-2/mcp-server'

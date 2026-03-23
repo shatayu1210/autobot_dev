@@ -46,7 +46,7 @@ def call_llm(
     """Call Gemini via google-genai client. Uses ADC or GEMINI_API_KEY."""
     client = genai.Client()
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-05-20")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
     if system_prompt:
         contents = [{"role": "user", "parts": [{"text": system_prompt + "\n\n" + prompt}]}]
