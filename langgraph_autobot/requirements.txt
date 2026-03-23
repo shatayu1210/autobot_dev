@@ -1,0 +1,8 @@
+langgraph>=0.2
+langchain-core>=0.3
+fastapi
+uvicorn[standard]
+httpx
+google-generativeai
+google-genai
+python-dotenv
