@@ -182,27 +182,57 @@ async def chat_stream(request: SimpleChatRequest):
     )
 
     async def event_generator():
-        final_text = ""
+        # Only capture the patch_output agent's text — it produces the final formatted result.
+        # All other agents' text (plan, diff, critic) is embedded inside patch_output's message.
+        patch_output_text = ""
+        all_text_by_author: dict = {}
+
         async for event in events:
-            # Send progress updates based on which agent is active
-            if event["author"] == "planner":
+            author = event.get("author", "")
+            logger.info(f"[event_generator] author={author!r} has_content={'content' in event and bool(event.get('content'))}")
+
+            # Send progress updates
+            if author == "planner":
                 yield json.dumps({"type": "progress", "text": "Planner is analyzing the issue and building a patch plan..."}) + "\n"
-            elif event["author"] == "patcher":
+            elif author == "patcher":
                 yield json.dumps({"type": "progress", "text": "Patcher is generating the unified diff..."}) + "\n"
-            elif event["author"] == "critic":
+            elif author == "critic":
                 yield json.dumps({"type": "progress", "text": "Critic is evaluating the diff..."}) + "\n"
-            elif event["author"] == "verdict_checker":
+            elif author == "verdict_checker":
                 yield json.dumps({"type": "progress", "text": "Checking verdict..."}) + "\n"
-            elif event["author"] == "patch_output":
+            elif author == "patch_output":
                 yield json.dumps({"type": "progress", "text": "Finalizing result..."}) + "\n"
-            # Accumulate final text
+
+            # Extract text from this event
             if "content" in event and event["content"]:
-                content = genai_types.Content.model_validate(event["content"])
-                for part in content.parts: # type: ignore
-                    if part.text:
-                        final_text += part.text
-        # Send final result
-        yield json.dumps({"type": "result", "text": final_text.strip()}) + "\n"
+                try:
+                    content = genai_types.Content.model_validate(event["content"])
+                    for part in content.parts or []:  # type: ignore
+                        if part.text and part.text.strip():
+                            all_text_by_author.setdefault(author, "")
+                            all_text_by_author[author] += part.text
+                            # Capture patch_output separately — this is the final formatted result
+                            if author == "patch_output":
+                                patch_output_text += part.text
+                except Exception as e:
+                    logger.warning(f"[event_generator] Could not parse content for author={author}: {e}")
+
+        # Prefer patch_output's text; fall back to the last non-empty agent's text
+        result_text = patch_output_text.strip()
+        if not result_text and all_text_by_author:
+            # Use the last agent that produced text
+            for author in reversed(list(all_text_by_author.keys())):
+                candidate = all_text_by_author[author].strip()
+                if candidate:
+                    result_text = candidate
+                    logger.warning(f"[event_generator] patch_output empty; using text from author={author!r}")
+                    break
+
+        if not result_text:
+            result_text = "Pipeline completed but produced no output. Check the server logs for details."
+
+        logger.info(f"[event_generator] Sending result ({len(result_text)} chars), authors seen: {list(all_text_by_author.keys())}")
+        yield json.dumps({"type": "result", "text": result_text}) + "\n"
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
