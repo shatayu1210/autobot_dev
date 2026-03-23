@@ -185,12 +185,16 @@ async def chat_stream(request: SimpleChatRequest):
         final_text = ""
         async for event in events:
             # Send progress updates based on which agent is active
-            if event["author"] == "researcher":
-                 yield json.dumps({"type": "progress", "text": "🔍 Researcher is gathering information..."}) + "\n"
-            elif event["author"] == "judge":
-                 yield json.dumps({"type": "progress", "text": "⚖️ Judge is evaluating findings..."}) + "\n"
-            elif event["author"] == "content_builder":
-                 yield json.dumps({"type": "progress", "text": "✍️ Content Builder is writing the course..."}) + "\n"
+            if event["author"] == "planner":
+                yield json.dumps({"type": "progress", "text": "Planner is analyzing the issue and building a patch plan..."}) + "\n"
+            elif event["author"] == "patcher":
+                yield json.dumps({"type": "progress", "text": "Patcher is generating the unified diff..."}) + "\n"
+            elif event["author"] == "critic":
+                yield json.dumps({"type": "progress", "text": "Critic is evaluating the diff..."}) + "\n"
+            elif event["author"] == "verdict_checker":
+                yield json.dumps({"type": "progress", "text": "Checking verdict..."}) + "\n"
+            elif event["author"] == "patch_output":
+                yield json.dumps({"type": "progress", "text": "Finalizing result..."}) + "\n"
             # Accumulate final text
             if "content" in event and event["content"]:
                 content = genai_types.Content.model_validate(event["content"])

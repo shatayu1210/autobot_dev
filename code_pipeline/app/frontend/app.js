@@ -44,7 +44,7 @@ createForm.addEventListener('submit', async (e) => {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                message: `Create a comprehensive course on: ${topic}`,
+                message: topic,
                 session_id: sessionId
             })
         });

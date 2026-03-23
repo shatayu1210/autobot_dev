@@ -248,13 +248,13 @@ planner = Agent(
     **Planning Prompt Format (for call_planner_endpoint):**
     Construct the prompt as:
     ```
-    ISSUE_TITLE: {{title}}
-    ISSUE_BODY: {{body}}
-    ISSUE_LABELS: {{labels}}
-    DISCUSSION: {{comments summary}}
+    ISSUE_TITLE: <title>
+    ISSUE_BODY: <body>
+    ISSUE_LABELS: <labels>
+    DISCUSSION: <comments summary>
 
     RELEVANT_CODE_SPANS:
-    {{code spans from get_code_spans}}
+    <code spans from get_code_spans>
 
     TASK: Generate a structured patch plan. For each file that needs changes:
     - File path (must exist in the repo index)

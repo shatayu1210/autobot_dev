@@ -9,6 +9,7 @@ export GOOGLE_CLOUD_PROJECT=$(gcloud config get-value project)
 export GOOGLE_CLOUD_LOCATION="global"
 export GOOGLE_GENAI_USE_VERTEXAI="True" # Use Gemini API locally
 export GOOGLE_API_KEY="" # Use if not using Vertex AI
+export GITHUB_TOKEN="${GITHUB_TOKEN:-}"  # Set this in your shell: export GITHUB_TOKEN=ghp_...
 
 echo "Starting Planner Agent on port 8001..."
 pushd agents/planner
