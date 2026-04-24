@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.18.1
+    container_name: autobot_neo4j
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt Protocol (for Python connection)
+    environment:
+      - NEO4J_AUTH=neo4j/autobot_password
+      # Automatically install APOC and Graph Data Science plugins
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      # Memory tuning for Graph operations
+      - NEO4J_dbms_memory_heap_initial__size=1G
+      - NEO4J_dbms_memory_heap_max__size=4G
+      - NEO4J_dbms_memory_pagecache_size=2G
+      # Allow loading CSVs from the import folder
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_export_file_enabled=true
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./import:/var/lib/neo4j/import
+      - ./plugins:/plugins
+    restart: unless-stopped

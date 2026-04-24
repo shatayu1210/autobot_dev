@@ -234,3 +234,19 @@ backups/
 temp_script.py
 .DS_Store
 slackbot/.git/
+
+# Local/generated data artifacts (do not commit)
+graphrag/data/
+graphrag/logs/
+etl/extracted_data/
+etl/training_data/
+etl/checkpoints/
+temp_check/
+tree_sitter/airflow/
+
+# Generated graph/tree-sitter binaries and indexes
+graphrag/plugins/*.jar
+
+# Generated training corpora snapshots (large)
+training/**/*_train_graphrag*.jsonl
+training/**/*_graphrag_v*.jsonl
