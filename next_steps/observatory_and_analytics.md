@@ -24,6 +24,15 @@ This document is a **graduate-project–level** blueprint for observability once
 - **Never** use Prometheus as a general log or event store; it is for numeric time series.  
 - **Do not** stream full prompts/responses to Prometheus; redact and sample for Snowflake or a dedicated log system.
 
+### In practice for this project (AutoBot)
+
+- **Prometheus + Grafana** → health, SLOs, “is the system on fire?”
+- **Logs** (structured JSON logs) → why a single request failed; include **correlation id** and/or **trace id** on every line
+- **Traces** (optional but useful) → where in the multi-agent flow time was spent (Planner → refinement → external calls)
+- **Snowflake** (or batch export) → deeper analytics, experiments, joins to labels — **not** the first line for “live debug this one error”
+
+For failure investigation, use the flow: **metrics (Grafana) to spot the spike** → **logs / traces to explain one request** → **Snowflake for cohort analysis** after the fact.
+
 ---
 
 ## 1) Naming and labels (use everywhere)
