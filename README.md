@@ -1,96 +1,164 @@
-# autobot_dev
+# AutoBot Dev Monorepo
 
-Monorepo for AutoBot data and tooling. Today this repo focuses on **ETL** (GitHub → Snowflake via Airflow). You can add other top-level folders later (e.g. `training/`, `labelling/`) without changing the layout below.
+This repository contains the end-to-end AutoBot pipeline for:
+- collecting GitHub issue/PR data,
+- building cleaned and time-sliced datasets,
+- generating model labels/training artifacts,
+- running model evaluation notebooks, and
+- serving predictions in Slack.
 
----
+## What This Repo Contains
 
-## Repository layout
+| Path | Purpose | Typical use |
+|------|---------|-------------|
+| `etl/` | Airflow + Docker ETL from GitHub to Snowflake (extract, clean, snapshot) | Data ingestion and snapshot generation |
+| `labelling/` | Label generation pipeline (`scorer`, `reasoner`, `planner`, `patcher`, `critic`) | Produce supervised training labels from snapshots |
+| `training/` | Model training notebooks/scripts (`bottleneck_detector`, `patch_planner`) | Train and tune task-specific models |
+| `evals/` | Evaluation notebooks for training runs and planner/critic outputs | Compare quality across runs |
+| `slackbot/` | Slack app + tooling to query data and return bottleneck analysis | User-facing bot integration |
+| `cli/` | Lightweight utility scripts and one-off data prep jobs | Local scripts for exports/indexing |
+| `code_pipeline/` | Separate starter/lab project for multi-agent evaluation experiments | Reference/experimental pipeline |
 
-| Path | Purpose |
-|------|---------|
-| **`etl/`** | Apache Airflow + Docker setup, DAGs, and Python deps for extract / clean / snapshot pipelines |
-| **`training/`** | Notebooks and training scripts (e.g. planner training + symbol context prep) |
-| *(future)* | e.g. `labelling/`, `notebooks/` — add as needed |
+## Data/Model Flow
 
----
+1. `etl/` extracts and cleans GitHub data, then creates T+7/T+14 snapshots.
+2. `labelling/` converts snapshots into model-specific labels.
+3. `training/` uses labeled data to train bottleneck/planner components.
+4. `evals/` tracks model quality and iteration results.
+5. `slackbot/` consumes outputs for interactive predictions.
 
-## ETL (`etl/`)
+## Quickstart By Goal (AI IDE Friendly)
 
-Airflow runs in Docker (see `etl/docker-compose.yml`). DAGs live in **`etl/dags/`** and are mounted into the container, so they show up in the Airflow UI after the scheduler parses them.
+Use this section when onboarding a new teammate or prompting an AI IDE assistant to run specific pipelines.
 
-### Prerequisites
+### Goal A: Rebuild ETL training corpus (`issues_clean.jsonl`, `prs_clean.jsonl`)
 
-- Docker + Docker Compose
-- Snowflake: an Airflow connection **`snowflake_default`** (Admin → Connections) with your account, user, password, warehouse, database, etc.
-- GitHub: either a **PAT** (`GITHUB_TOKEN`) or **GitHub App** credentials in `.env` — see `etl/.env.example`
+1. **Set environment**
+   - `cd etl`
+   - copy template env if needed: `cp .env.example .env`
+   - populate GitHub + Snowflake credentials
+2. **Run extraction**
+   - run Airflow DAG `full_extract` (see `etl/README.md`)
+   - choose `sink_mode=local` (writes JSONL to `etl/extracted_data/`) or `sink_mode=snowflake`
+3. **Consolidate and clean**
+   - `python3 etl/clean_and_consolidate.py`
+   - outputs written to `etl/training_data/`
+4. **Validate outputs**
+   - check these files exist:
+     - `etl/training_data/issues_clean.jsonl`
+     - `etl/training_data/prs_clean.jsonl`
+     - `etl/training_data/cleaning_report.json`
+5. **If extraction was interrupted**
+   - fix checkpoint drift: `python3 etl/recover_missing_issues.py --apply`
+   - or rebuild checkpoints: `python3 etl/rebuild_checkpoints.py`
 
-### Quick start
+Primary reference: `etl/README.md`
+
+### Goal B: Load cleaned data into Snowflake
+
+Use local loader when Airflow is unstable or for repeatable manual loads.
+
+```bash
+cd etl
+python3 load_to_snowflake.py \
+  --account <account> \
+  --user <user> \
+  --password '<password>' \
+  --source cleaned \
+  --mode both
+```
+
+Reference: `etl/load_to_snowflake.py` and `etl/README.md`
+
+### Goal C: Stand up GraphRAG and ingest Neo4j graph
+
+1. Start Neo4j:
+   - `cd graphrag && docker compose up -d`
+2. Ingest graph:
+   - `python ingest_graph_actual.py`
+3. (Optional) add embeddings:
+   - `python vectorize_issues.py`
+4. Sanity check in Neo4j Browser (`http://localhost:7474`):
+   - `MATCH (n) RETURN count(n);`
+   - `MATCH ()-[r]->() RETURN count(r);`
+
+Reference: `graphrag/README.md`
+
+### Goal D: Rebuild tree-sitter index for planner retrieval
+
+Rebuild when Airflow repo snapshot changes or when training data is refreshed and you want path/context alignment.
+
+```bash
+cd tree_sitter
+python3 build_treesitter_index.py \
+  --repo "/absolute/path/to/autobot_dev/tree_sitter/airflow" \
+  --output "/absolute/path/to/autobot_dev/tree_sitter/treesitter_index.json"
+```
+
+Reference: `tree_sitter/README.md`
+
+### Goal E: Generate patcher/planner training datasets
+
+1. Ensure prerequisites:
+   - cleaned ETL data in `etl/training_data/`
+   - Neo4j running (if GraphRAG enabled)
+   - tree-sitter index built for planner path-grounding
+2. Run builders under `training/patch_*` (for example `patch_patcher/build_patcher_data.py`, `patch_planner/build_planner_data.py`)
+3. Keep generated large artifacts in ignored local dirs; only commit scripts/docs/notebooks intended for collaboration.
+
+### AI IDE prompt template (copy/paste)
+
+Use this as a starting prompt for any assistant in Cursor/VS Code:
+
+```text
+You are helping with autobot_dev. First read README.md plus:
+- etl/README.md
+- graphrag/README.md
+- tree_sitter/README.md
+
+Goal: <replace with one goal above>.
+Constraints:
+- Do not commit secrets or large generated data.
+- Prefer reproducible commands and explicit validation checks.
+- After running steps, summarize outputs and next actions.
+```
+
+## Quick Start (Most Common Path)
+
+### 1) Run ETL
 
 1. `cd etl`
-2. Copy env template: `cp .env.example .env` and fill in secrets (never commit `.env`).
-3. Configure **`snowflake_default`** in the Airflow UI (or equivalent env-based connection if you use that pattern).
-4. Build and start: `docker compose up -d` (from `etl/`; see `docker-compose.yml` for ports, e.g. web UI).
-5. In the UI, unpause the DAGs you need and trigger manually where schedules are `None`.
+2. Copy template env: `cp .env.example .env`
+3. Fill credentials and set Snowflake connection (`snowflake_default`)
+4. Start services: `docker compose up -d`
+5. Trigger DAGs in Airflow UI (extract -> clean -> snapshot)
 
-### DAGs (what each one does)
+### 2) Build labels
 
-All of these run **on demand** in the UI unless you add a schedule later.
+1. `cd labelling`
+2. Install deps: `pip install -r requirements.txt`
+3. Run examples:
+   - `python label_pipeline.py --model scorer`
+   - `python label_pipeline.py --model all --stats`
 
-#### `full_extract` — production GitHub → Snowflake
+### 3) Train and evaluate
 
-- Pulls **closed issues** and **linked PRs** from the **`apache/airflow`** GitHub repo.
-- Writes into Snowflake **RAW** tables (issues + PRs).
-- Uses checkpoints so a long run can **resume** if it stops partway.
-- Good for: filling or refreshing your RAW layer from GitHub.
+- Use notebooks under `training/` for model training
+- Use notebooks under `evals/` for run comparison and quality checks
 
-#### `test_extract` — tiny sanity check (no Snowflake required for the sample path)
+## ETL DAGs at a Glance
 
-- Grabs only **10 issues** (and their linked PRs) as a **smoke test**.
-- Writes **JSON files** to `test_output/` on your machine (via the Docker volume mount).
-- Good for: verifying GitHub auth and extract logic before a big `full_extract`.
+- `full_extract`: full GitHub issues/PR ingestion to Snowflake RAW tables
+- `test_extract`: small smoke test extraction (useful before full runs)
+- `clean_bot_issues`: legacy cleaner DAG (kept in history; current cleaning path is script-driven in `etl/clean_and_consolidate.py`)
+- `snapshot_issues`: CLEANED -> PRELAB issue snapshots at T+7/T+14 (if enabled in your branch)
 
-#### `clean_bot_issues` — RAW → CLEANED in Snowflake
+## Security Notes
 
-- Reads a **source** issues table (default: RAW) and writes a **cleaned** copy (default: CLEANED).
-- Drops rows you don’t want for modelling (e.g. titles that look like **chore / bump / dependabot** — patterns are configurable in params).
-- Good for: one table you trust for downstream steps (snapshots, labelling).
+- Never commit real secrets (`.env`, private keys, service account files, API tokens).
+- Use `.env.example` as the only committed env template.
+- If a key is ever exposed, rotate it immediately and clean history before public release.
 
-#### `snapshot_issues` — CLEANED → PRELAB (T+7 and T+14)
+## Repo Status
 
-- For each issue, builds **two** “as-of” views: **7 days** and **14 days** after **issue creation** (`created_at`).
-- **Re-computes** which PRs were linked **using only timeline (and body/comments) up to that snapshot date** — it does **not** rely on the old `linked_pr_numbers` column for that.
-- Strips **closure** info in the snapshot (e.g. treats as still **open** in the snapshot JSON) so the row matches “what you’d have known at day 7 / 14.”
-- Writes **`SCORER_ISSUES_T7`** and **`SCORER_ISSUES_T14`** in **PRELAB** (defaults in DAG params).
-- Tagged **`snapshot`** in the Airflow UI so it’s easy to filter.
-- Good for: handing off consistent issue snapshots to scoring / labelling scripts.
-
-Default database/schema/table names are in each DAG’s **Trigger** params and docstrings (e.g. `AIRFLOW_ML.CLEANED.GITHUB_ISSUES`, `AIRFLOW_ML.PRELAB.SCORER_ISSUES_T7` / `_T14`).
-
-### Important files
-
-| File | Role |
-|------|------|
-| `etl/Dockerfile` | Airflow image + `requirements.txt` install |
-| `etl/docker-compose.yml` | Postgres metadata DB, webserver, scheduler, env wiring |
-| `etl/requirements.txt` | Extra Python packages (Snowflake provider, JWT, etc.) |
-| `etl/.env.example` | Safe template for local secrets and compose vars |
-| `etl/.gitignore` | Ignores `.env`, keys (`*.pem`), logs, `temp_script.py`, local outputs |
-
-### Secrets & local-only files
-
-Do **not** commit:
-
-- `.env`, private keys (`.pem`), service account JSONs
-- `temp_script.py` (local GitHub App token experiments — ignored by `etl/.gitignore`)
-
-Share these with collaborators out-of-band (1Password, etc.).
-
-### Snapshot implementation note
-
-The **Airflow** entry point for T+7 / T+14 snapshots is the DAG `snapshot_issues` in `etl/dags/snapshot_issues.py`. If you keep a separate CLI copy elsewhere, treat the DAG file as the source of truth for scheduled runs.
-
----
-
-## Contributing / next steps
-
-- Add folders like `training/` or `labelling/` at the repo root when you’re ready; keep README sections parallel to this **ETL** block for discoverability.
+This is an active research/development monorepo. Some folders (for example `evals/` and parts of `code_pipeline/`) are exploratory and may change structure between runs.

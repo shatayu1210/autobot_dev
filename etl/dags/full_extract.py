@@ -1,11 +1,13 @@
 """
-Full GitHub Extract DAG (Production)
-===================================
-Extracts all closed issues + linked PRs from apache/airflow into Snowflake RAW schema.
+Full GitHub Extract DAG (Production v2.0 - Optimized)
+====================================================
+Extracts closed issues + linked PRs from apache/airflow into Snowflake RAW.
 
-This is the production DAG:
-- Always loads to Snowflake (no test mode logic)
-- Checkpoints progress in /tmp/autobot_checkpoints to allow safe resume
+Optimized for AutoBot v4 Training Data:
+- Scorer/Reasoner: Timeline, comment gaps, days open [cite: 63-91]
+- Planner: Issue context, repo symbols [cite: 110-124]
+- Patcher: Unified diffs (ground truth) [cite: 141-150]
+- Critic: CI check-runs, review comments [cite: 156-167]
 """
 
 from datetime import datetime, timedelta
@@ -13,1009 +15,494 @@ import logging
 import json
 import os
 import time
+import asyncio
+import re
 import random
 from pathlib import Path
+from typing import List, Dict, Any
 
+import httpx
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import Param
-
+from airflow.models import Param, Variable
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
 # ============================================================================
-# CONSTANTS
+# CONSTANTS & CONFIG (Restored from Original)
 # ============================================================================
 
 GITHUB_API_BASE = "https://api.github.com"
 REPO_OWNER = "apache"
 REPO_NAME = "airflow"
-PER_PAGE = 100
-RATE_LIMIT_BUFFER = 100
-MAX_RETRIES = 5
-CHECKPOINT_DIR = Path("/tmp/autobot_checkpoints")
+# Persisted via Docker volume (survives container restart)
+CHECKPOINT_DIR = Path("/opt/airflow/code_v2/checkpoints")
+EXTRACTED_DATA_DIR = Path("/opt/airflow/code_v2/extracted_data")  # local sink output
+LOCAL_TEMP_DIR = Path("/tmp/autobot_bulk_load")  # ephemeral staging for Snowflake PUT
+CONCURRENCY_LIMIT = 15
 
-# Snowflake table names
 ISSUES_TABLE = "GITHUB_ISSUES"
 PRS_TABLE = "GITHUB_PRS"
-
-# Log GitHub rate limit once + periodically (helps confirm App token tier + progress)
-_RATE_LIMIT_LOGGED = False
-_GITHUB_REQUEST_COUNT = 0
-_GITHUB_RATE_LOG_EVERY = 200  # log rate headers every N GitHub requests
-
-# Optional local backup root (mounted to host via /opt/airflow/code_v2)
-BACKUP_ROOT = Path("/opt/airflow/code_v2/backups/full_extract")
-
-
-# ============================================================================
-# DEFAULT DAG ARGS
-# ============================================================================
 
 default_args = {
     "owner": "autobot",
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
-    "retries": 1,
-    "retry_delay": timedelta(minutes=10),
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
 }
 
-
 # ============================================================================
-# GITHUB CLIENT
+# EFFICIENCY ENGINES: ASYNC & BULK LOAD
 # ============================================================================
 
 def _get_github_token():
-    """
-    Generate a GitHub App installation access token.
-    Falls back to personal token env var if App credentials not configured.
-    App tokens have higher rate limits vs personal tokens.
-    """
-    import jwt
-    import requests as req
-    import time as _time
-
+    """Consistent with original: App Token first, then Variable/Env."""
     try:
-        from airflow.models import Variable
-
+        import jwt
         app_id = Variable.get("GITHUB_APP_ID")
-        installation_id = Variable.get("GITHUB_APP_INSTALLATION_ID")
-        private_key = Variable.get("GITHUB_APP_PRIVATE_KEY")  # full PEM string
-    except Exception:
-        token = os.environ.get("GITHUB_TOKEN")
-        if not token:
-            raise ValueError("No GitHub credentials found (App vars or GITHUB_TOKEN).")
-        logging.info("GitHub auth: using personal access token (GITHUB_TOKEN).")
-        return token
+        install_id = Variable.get("GITHUB_APP_INSTALLATION_ID")
+        pk = Variable.get("GITHUB_APP_PRIVATE_KEY").replace("\\n", "\n").strip()
+        now = int(time.time())
+        payload = {"iat": now - 60, "exp": now + 600, "iss": app_id}
+        token = jwt.encode(payload, pk, algorithm="RS256")
+        resp = httpx.post(f"https://api.github.com/app/installations/{install_id}/access_tokens",
+                          headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+        return resp.json()["token"]
+    except:
+        return Variable.get("GITHUB_TOKEN", os.environ.get("GITHUB_TOKEN"))
 
-    # Airflow Variables sometimes store PEM with literal "\n"
-    private_key = (private_key or "").replace("\\n", "\n").strip()
-    if not private_key:
-        raise ValueError("GITHUB_APP_PRIVATE_KEY is empty.")
+class GitHubAsyncClient:
+    def __init__(self, token):
+        self._token = token
+        self.client = httpx.AsyncClient(
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=60.0,
+        )
+        self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        self._rate_limit_until: float = 0.0  # epoch seconds to sleep until
+        self._token_lock = asyncio.Lock()  # prevent concurrent token refreshes
 
-    now = int(_time.time())
-    payload = {"iat": now - 60, "exp": now + (10 * 60), "iss": app_id}
-    jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
+    def _refresh_token(self):
+        """Fetch a fresh GitHub App token and hot-swap it into the httpx session headers."""
+        logging.warning("GitHub token expired (401). Refreshing token...")
+        new_token = _get_github_token()
+        self._token = new_token
+        self.client.headers["Authorization"] = f"token {new_token}"
+        logging.info("GitHub token refreshed successfully.")
 
-    resp = req.post(
-        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-        headers={
-            "Authorization": f"Bearer {jwt_token}",
-            "Accept": "application/vnd.github+json",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    logging.info("GitHub auth: using GitHub App installation token.")
-    return resp.json()["token"]
-
-
-def _github_request(session, url, params=None, attempt=0):
-    """
-    Single GitHub API GET with:
-      - Rate limit awareness (sleep until reset if near limit)
-      - Exponential backoff on 403/429/5xx
-      - Secondary rate limit (abuse detection) jitter
-    Returns parsed JSON or raises after MAX_RETRIES.
-    """
-    if params is None:
-        params = {}
-
-    try:
-        global _GITHUB_REQUEST_COUNT
-        _GITHUB_REQUEST_COUNT += 1
-
-        response = session.get(url, params=params, timeout=30)
-
-        remaining = int(response.headers.get("X-RateLimit-Remaining", 999))
-        reset_at = int(response.headers.get("X-RateLimit-Reset", 0))
-        limit = response.headers.get("X-RateLimit-Limit")
-
-        global _RATE_LIMIT_LOGGED
-        if (not _RATE_LIMIT_LOGGED and limit is not None) or (
-            limit is not None and _GITHUB_REQUEST_COUNT % _GITHUB_RATE_LOG_EVERY == 0
-        ):
-            logging.info(
-                "GitHub rate limit: "
-                f"remaining={remaining} limit={limit} reset={reset_at} "
-                f"(requests_made={_GITHUB_REQUEST_COUNT})"
-            )
-            _RATE_LIMIT_LOGGED = True
-
-        if remaining < RATE_LIMIT_BUFFER:
-            sleep_secs = max(reset_at - int(time.time()), 0) + 5
+    async def _wait_for_rate_limit(self):
+        """If a rate limit window is active, sleep until it clears."""
+        now = time.time()
+        if self._rate_limit_until > now:
+            sleep_secs = self._rate_limit_until - now + 2  # +2s buffer
             logging.warning(
-                f"Rate limit low ({remaining} remaining of {limit}). "
-                f"Sleeping {sleep_secs}s until reset (requests_made={_GITHUB_REQUEST_COUNT})."
+                f"Rate limit active — sleeping {sleep_secs:.0f}s until reset "
+                f"({time.strftime('%H:%M:%S', time.gmtime(self._rate_limit_until))} UTC)"
             )
-            time.sleep(sleep_secs)
+            await asyncio.sleep(sleep_secs)
 
-        if response.status_code == 200:
-            return response.json()
+    async def request(self, url, params=None, method="GET", json_data=None):
+        await self._wait_for_rate_limit()
+        async with self.semaphore:
+            for attempt in range(8):  # more attempts since rate-limit sleeps don't count
+                try:
+                    resp = (
+                        await self.client.post(url, json=json_data)
+                        if method == "POST"
+                        else await self.client.get(url, params=params)
+                    )
 
-        # If the token becomes invalid mid-run, GitHub returns 401.
-        # Refresh the token/session and retry the request.
-        if response.status_code == 401:
-            logging.warning(
-                f"HTTP 401 Unauthorized on {url}. Refreshing GitHub token and retrying "
-                f"(attempt {attempt+1}/{MAX_RETRIES})."
-            )
-            if attempt < MAX_RETRIES:
-                new_token = _get_github_token()
-                new_session = _build_session(new_token)
-                return _github_request(new_session, url, params, attempt + 1)
-            raise RuntimeError(f"GitHub auth failed (401) persisting on {url}")
+                    # Log remaining quota periodically
+                    remaining = resp.headers.get("X-RateLimit-Remaining")
+                    reset_at = resp.headers.get("X-RateLimit-Reset")
+                    if remaining and int(remaining) < 200:
+                        logging.warning(
+                            f"GitHub rate limit low: {remaining} remaining, "
+                            f"resets at {time.strftime('%H:%M:%S UTC', time.gmtime(int(reset_at)))}"
+                        )
 
-        if response.status_code in (403, 429):
-            retry_after = int(response.headers.get("Retry-After", 0))
-            if retry_after:
-                logging.warning(f"Retry-After header: sleeping {retry_after}s")
-                time.sleep(retry_after)
+                    if resp.status_code == 200:
+                        return resp.json()
+
+                    if resp.status_code == 401:
+                        # Token expired — refresh and retry without consuming an attempt
+                        async with self._token_lock:
+                            self._refresh_token()
+                        continue
+
+                    if resp.status_code in (403, 429):
+                        # Prefer X-RateLimit-Reset over Retry-After for primary limit
+                        reset_ts = resp.headers.get("X-RateLimit-Reset")
+                        retry_after = resp.headers.get("Retry-After")
+
+                        if reset_ts:
+                            self._rate_limit_until = float(reset_ts)
+                            sleep_secs = max(float(reset_ts) - time.time(), 0) + 2
+                            logging.warning(
+                                f"Primary rate limit hit (HTTP {resp.status_code}). "
+                                f"Sleeping {sleep_secs:.0f}s until "
+                                f"{time.strftime('%H:%M:%S UTC', time.gmtime(float(reset_ts)))} — "
+                                f"then retrying {url}"
+                            )
+                            await asyncio.sleep(sleep_secs)
+                            self._rate_limit_until = 0.0
+                        elif retry_after:
+                            # Secondary / abuse rate limit
+                            sleep_secs = int(retry_after) + 2
+                            logging.warning(
+                                f"Secondary rate limit (Retry-After={retry_after}s). "
+                                f"Sleeping {sleep_secs}s — then retrying {url}"
+                            )
+                            await asyncio.sleep(sleep_secs)
+                        else:
+                            # Fallback: 60s
+                            logging.warning(f"HTTP {resp.status_code} with no reset header — sleeping 60s")
+                            await asyncio.sleep(60)
+
+                        # Do NOT increment attempt — rate limit sleeps are free retries
+                        continue
+
+                    if resp.status_code == 404:
+                        return None  # Issue genuinely doesn't exist
+
+                    resp.raise_for_status()
+
+                except httpx.TimeoutException:
+                    backoff = min(2 ** attempt * 5, 60) + random.random()
+                    logging.warning(f"Timeout on {url} (attempt {attempt+1}/8). Retrying in {backoff:.1f}s")
+                    await asyncio.sleep(backoff)
+                except Exception as e:
+                    backoff = min(2 ** attempt * 3, 60) + random.random()
+                    logging.warning(f"Request error on {url} (attempt {attempt+1}/8): {e}. Retrying in {backoff:.1f}s")
+                    await asyncio.sleep(backoff)
+
+        logging.error(f"All retries exhausted for {url} — returning None")
+        return None
+
+def _write_local(table_name, records):
+    """Persist JSONL to the Docker-volume-backed extracted_data dir (local sink mode)."""
+    if not records: return
+    EXTRACTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = EXTRACTED_DATA_DIR / f"{table_name}_{int(time.time())}.jsonl"
+    with open(file_path, "w") as f:
+        for r in records: f.write(json.dumps(r) + "\n")
+    logging.info(f"Local mode: wrote {len(records)} records to {file_path}")
+
+def _bulk_load_snowflake(table_name, records, database, schema):
+    """Uses PUT + COPY INTO for massive ingestion speed. Retries on transient DNS/connection errors."""
+    if not records: return
+    LOCAL_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = LOCAL_TEMP_DIR / f"{table_name}_{int(time.time())}.jsonl"
+    with open(file_path, "w") as f:
+        for r in records: f.write(json.dumps(r) + "\n")
+
+    for sf_attempt in range(5):
+        try:
+            hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
+            conn = hook.get_conn()
+            with conn.cursor() as cur:
+                cur.execute(f"USE DATABASE {database}"); cur.execute(f"USE SCHEMA {schema}")
+                cur.execute(f"CREATE OR REPLACE TEMPORARY STAGE {table_name}_STG")
+                cur.execute(f"PUT file://{file_path} @{table_name}_STG")
+
+                if table_name == ISSUES_TABLE:
+                    cur.execute(f"""
+                        COPY INTO {table_name} (
+                            issue_number, repo, title, state, labels,
+                            assignee_count, milestone, comment_count, linked_pr_count,
+                            created_at, closed_at, extracted_at, raw_json
+                        )
+                        FROM (
+                            SELECT 
+                                $1:issue_number::INTEGER,
+                                $1:repo::VARCHAR,
+                                SUBSTR($1:issue:title::VARCHAR, 1, 1000),
+                                $1:issue:state::VARCHAR,
+                                $1:label_names::ARRAY,
+                                COALESCE(ARRAY_SIZE($1:issue:assignees::ARRAY), 0),
+                                SUBSTR($1:issue:milestone:title::VARCHAR, 1, 500),
+                                IFNULL($1:issue:comments::INTEGER, 0),
+                                COALESCE(ARRAY_SIZE($1:linked_pr_numbers::ARRAY), 0),
+                                $1:issue:created_at::TIMESTAMP_NTZ,
+                                $1:issue:closed_at::TIMESTAMP_NTZ,
+                                $1:extracted_at::TIMESTAMP_NTZ,
+                                $1
+                            FROM @{table_name}_STG
+                        )
+                        FILE_FORMAT=(TYPE='JSON')
+                    """)
+                elif table_name == PRS_TABLE:
+                    cur.execute(f"""
+                        COPY INTO {table_name} (
+                            pr_number, repo, linked_issue_number, pr_title, state,
+                            is_merged, base_sha, head_sha, changed_files_count,
+                            review_count, ci_conclusion, merged_at, created_at,
+                            extracted_at, raw_json
+                        )
+                        FROM (
+                            SELECT 
+                                $1:pr_number::INTEGER,
+                                $1:repo::VARCHAR,
+                                $1:linked_issue_number::INTEGER,
+                                SUBSTR($1:pr:title::VARCHAR, 1, 1000),
+                                $1:pr:state::VARCHAR,
+                                CASE WHEN $1:pr:merged_at IS NOT NULL THEN TRUE ELSE FALSE END,
+                                $1:pr:base:sha::VARCHAR,
+                                $1:pr:head:sha::VARCHAR,
+                                IFNULL($1:pr:changed_files::INTEGER, 0),
+                                COALESCE(ARRAY_SIZE($1:reviews::ARRAY), 0),
+                                $1:ci_conclusion::VARCHAR,
+                                $1:pr:merged_at::TIMESTAMP_NTZ,
+                                $1:pr:created_at::TIMESTAMP_NTZ,
+                                $1:extracted_at::TIMESTAMP_NTZ,
+                                $1
+                            FROM @{table_name}_STG
+                        )
+                        FILE_FORMAT=(TYPE='JSON')
+                    """)
+                else:
+                    cur.execute(f"COPY INTO {table_name} (raw_json) FROM @{table_name}_STG FILE_FORMAT=(TYPE='JSON')")
+            conn.commit()
+            return  # success
+        except Exception as e:
+            if sf_attempt < 4:
+                wait = 30 * (sf_attempt + 1)
+                logging.warning(f"Snowflake connection error (attempt {sf_attempt+1}/5): {e}. Retrying in {wait}s...")
+                time.sleep(wait)
             else:
-                backoff = min(2**attempt * 10, 300) + random.uniform(0, 5)
-                logging.warning(
-                    f"HTTP {response.status_code} on {url}. "
-                    f"Backoff {backoff:.1f}s (attempt {attempt+1}/{MAX_RETRIES})"
-                )
-                time.sleep(backoff)
-
-            if attempt < MAX_RETRIES:
-                return _github_request(session, url, params, attempt + 1)
-            raise RuntimeError(f"Max retries exceeded on {url}")
-
-        if response.status_code == 404:
-            logging.debug(f"404 on {url} — returning empty list")
-            return []
-
-        if response.status_code >= 500:
-            backoff = min(2**attempt * 15, 300) + random.uniform(0, 5)
-            logging.warning(
-                f"HTTP {response.status_code} on {url}. "
-                f"Backoff {backoff:.1f}s (attempt {attempt+1}/{MAX_RETRIES})"
-            )
-            time.sleep(backoff)
-            if attempt < MAX_RETRIES:
-                return _github_request(session, url, params, attempt + 1)
-            raise RuntimeError(f"Server errors persisting on {url}")
-
-        logging.warning(f"Unexpected status {response.status_code} on {url}")
-        return None
-
-    except Exception as e:
-        if attempt < MAX_RETRIES:
-            backoff = min(2**attempt * 10, 120) + random.uniform(0, 5)
-            logging.warning(f"Request error: {e}. Retrying in {backoff:.1f}s")
-            time.sleep(backoff)
-            return _github_request(session, url, params, attempt + 1)
-        raise
-
-
-def _paginate(session, url, extra_params=None, max_items=None):
-    """
-    Paginate through all pages of a GitHub list endpoint.
-    Yields individual items. Stops at max_items if set.
-    """
-    params = {"per_page": PER_PAGE, "page": 1}
-    if extra_params:
-        params.update(extra_params)
-
-    collected = 0
-    while True:
-        page_data = _github_request(session, url, params)
-        if not page_data:
-            break
-
-        for item in page_data:
-            yield item
-            collected += 1
-            if max_items and collected >= max_items:
-                return
-
-        if len(page_data) < PER_PAGE:
-            break
-
-        params["page"] += 1
-        time.sleep(0.3)
-
-
-def _build_session(token):
-    import requests
-
-    session = requests.Session()
-    session.headers.update(
-        {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-    )
-    return session
-
+                logging.error(f"Snowflake bulk load failed after 5 attempts: {e}")
+                raise
 
 # ============================================================================
-# CHECKPOINT HELPERS
+# SIGNAL FETCHERS (AutoBot v4 Signal Compliance)
 # ============================================================================
 
-def _load_checkpoint(name):
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    path = CHECKPOINT_DIR / f"{name}.json"
-    if path.exists():
-        with open(path) as f:
-            data = json.load(f)
-        logging.info(f"Resumed checkpoint '{name}': {len(data)} items")
-        return data
-    return None
-
-
-def _save_checkpoint(name, data):
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    path = CHECKPOINT_DIR / f"{name}.json"
-    with open(path, "w") as f:
-        json.dump(data, f)
-
-
-def _clear_checkpoint(name):
-    path = CHECKPOINT_DIR / f"{name}.json"
-    if path.exists():
-        path.unlink()
-
-
-# ============================================================================
-# SNOWFLAKE HELPERS
-# ============================================================================
-
-def _get_snowflake_conn(database, schema):
-    """Return a Snowflake connection using Airflow's snowflake_default conn."""
-    from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-
-    hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
-    conn = hook.get_conn()
-    cursor = conn.cursor()
-    cursor.execute(f"USE DATABASE {database}")
-    cursor.execute(f"USE SCHEMA {schema}")
-    return conn, cursor
-
-
-def _ensure_tables(cursor, database, schema, issues_table, prs_table):
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {database}.{schema}.{issues_table} (
-            issue_number        INTEGER         NOT NULL,
-            repo                VARCHAR(200)    NOT NULL,
-            title               VARCHAR(1000),
-            state               VARCHAR(20),
-            labels              ARRAY,
-            assignee_count      INTEGER,
-            milestone           VARCHAR(500),
-            comment_count       INTEGER,
-            linked_pr_count     INTEGER,
-            created_at          TIMESTAMP_NTZ,
-            closed_at           TIMESTAMP_NTZ,
-            extracted_at        TIMESTAMP_NTZ   DEFAULT CURRENT_TIMESTAMP(),
-            raw_json            VARIANT,
-            PRIMARY KEY (issue_number, repo)
-        )
-    """
-    )
-
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {database}.{schema}.{prs_table} (
-            pr_number               INTEGER         NOT NULL,
-            repo                    VARCHAR(200)    NOT NULL,
-            linked_issue_number     INTEGER,
-            pr_title                VARCHAR(1000),
-            state                   VARCHAR(20),
-            is_merged               BOOLEAN,
-            base_sha                VARCHAR(100),
-            head_sha                VARCHAR(100),
-            changed_files_count     INTEGER,
-            review_count            INTEGER,
-            ci_conclusion           VARCHAR(50),
-            merged_at               TIMESTAMP_NTZ,
-            created_at              TIMESTAMP_NTZ,
-            extracted_at            TIMESTAMP_NTZ   DEFAULT CURRENT_TIMESTAMP(),
-            raw_json                VARIANT,
-            PRIMARY KEY (pr_number, repo)
-        )
-    """
-    )
-
-    logging.info(f"Tables ensured: {issues_table}, {prs_table}")
-
-
-def _upsert_issues_batch(cursor, database, schema, issues_table, batch):
-    if not batch:
-        return
-
-    merge_sql = f"""
-        MERGE INTO {database}.{schema}.{issues_table} AS target
-        USING (
-            SELECT
-                %s::INTEGER           AS issue_number,
-                %s::VARCHAR           AS repo,
-                %s::VARCHAR           AS title,
-                %s::VARCHAR           AS state,
-                PARSE_JSON(%s)::ARRAY AS labels,
-                %s::INTEGER           AS assignee_count,
-                %s::VARCHAR           AS milestone,
-                %s::INTEGER           AS comment_count,
-                %s::INTEGER           AS linked_pr_count,
-                %s::TIMESTAMP_NTZ     AS created_at,
-                %s::TIMESTAMP_NTZ     AS closed_at,
-                CURRENT_TIMESTAMP()   AS extracted_at,
-                PARSE_JSON(%s)        AS raw_json
-        ) AS src
-        ON target.issue_number = src.issue_number
-        AND target.repo        = src.repo
-        WHEN MATCHED THEN UPDATE SET
-            title           = src.title,
-            state           = src.state,
-            labels          = src.labels,
-            assignee_count  = src.assignee_count,
-            milestone       = src.milestone,
-            comment_count   = src.comment_count,
-            linked_pr_count = src.linked_pr_count,
-            closed_at       = src.closed_at,
-            extracted_at    = src.extracted_at,
-            raw_json        = src.raw_json
-        WHEN NOT MATCHED THEN INSERT (
-            issue_number, repo, title, state, labels,
-            assignee_count, milestone, comment_count, linked_pr_count,
-            created_at, closed_at, extracted_at, raw_json
-        ) VALUES (
-            src.issue_number, src.repo, src.title, src.state, src.labels,
-            src.assignee_count, src.milestone, src.comment_count, src.linked_pr_count,
-            src.created_at, src.closed_at, src.extracted_at, src.raw_json
-        )
-    """
-
-    for rec in batch:
-        issue = rec["issue"]
-
-        title = (issue.get("title") or "")[:1000]
-        state = issue.get("state") or ""
-        labels = json.dumps([l["name"] for l in issue.get("labels", []) if l.get("name")])
-        assignee_count = len(issue.get("assignees") or [])
-        milestone = (((issue.get("milestone") or {}).get("title")) or "")[:500]
-        comment_count = issue.get("comments") or 0
-        linked_pr_count = len(rec.get("linked_pr_numbers") or [])
-        created_at = issue.get("created_at") or None
-        closed_at = issue.get("closed_at") or None
-        raw_json = json.dumps(rec)
-
-        cursor.execute(
-            merge_sql,
-            (
-                issue["number"],
-                f"{REPO_OWNER}/{REPO_NAME}",
-                title,
-                state,
-                labels,
-                assignee_count,
-                milestone,
-                comment_count,
-                linked_pr_count,
-                created_at,
-                closed_at,
-                raw_json,
-            ),
-        )
-
-
-def _upsert_prs_batch(cursor, database, schema, batch):
-    if not batch:
-        return
-
-def _upsert_prs_batch(cursor, database, schema, prs_table, batch):
-    """
-    Upsert a batch of PR records into Snowflake.
-    """
-    if not batch:
-        return
-
-    merge_sql = f"""
-        MERGE INTO {database}.{schema}.{prs_table} AS target
-        USING (
-            SELECT
-                %s::INTEGER         AS pr_number,
-                %s::VARCHAR         AS repo,
-                %s::INTEGER         AS linked_issue_number,
-                %s::VARCHAR         AS pr_title,
-                %s::VARCHAR         AS state,
-                %s::BOOLEAN         AS is_merged,
-                %s::VARCHAR         AS base_sha,
-                %s::VARCHAR         AS head_sha,
-                %s::INTEGER         AS changed_files_count,
-                %s::INTEGER         AS review_count,
-                %s::VARCHAR         AS ci_conclusion,
-                %s::TIMESTAMP_NTZ   AS merged_at,
-                %s::TIMESTAMP_NTZ   AS created_at,
-                CURRENT_TIMESTAMP() AS extracted_at,
-                PARSE_JSON(%s)      AS raw_json
-        ) AS src
-        ON target.pr_number = src.pr_number
-        AND target.repo     = src.repo
-        WHEN MATCHED THEN UPDATE SET
-            linked_issue_number = src.linked_issue_number,
-            pr_title            = src.pr_title,
-            state               = src.state,
-            is_merged           = src.is_merged,
-            base_sha            = src.base_sha,
-            head_sha            = src.head_sha,
-            changed_files_count = src.changed_files_count,
-            review_count        = src.review_count,
-            ci_conclusion       = src.ci_conclusion,
-            merged_at           = src.merged_at,
-            extracted_at        = src.extracted_at,
-            raw_json            = src.raw_json
-        WHEN NOT MATCHED THEN INSERT (
-            pr_number, repo, linked_issue_number, pr_title, state,
-            is_merged, base_sha, head_sha, changed_files_count,
-            review_count, ci_conclusion, merged_at, created_at,
-            extracted_at, raw_json
-        ) VALUES (
-            src.pr_number, src.repo, src.linked_issue_number, src.pr_title,
-            src.state, src.is_merged, src.base_sha, src.head_sha,
-            src.changed_files_count, src.review_count, src.ci_conclusion,
-            src.merged_at, src.created_at, src.extracted_at, src.raw_json
-        )
-    """
-
-    for rec in batch:
-        pr = rec["pr"]
-
-        pr_title = (pr.get("title") or "")[:1000]
-        state = pr.get("state") or ""
-        is_merged = pr.get("merged_at") is not None
-        base_sha = (pr.get("base") or {}).get("sha") or ""
-        head_sha = (pr.get("head") or {}).get("sha") or ""
-        changed_files = pr.get("changed_files") or 0
-        review_count = len(rec.get("reviews") or [])
-        merged_at = pr.get("merged_at") or None
-        created_at = pr.get("created_at") or None
-
-        conclusions = [
-            cr.get("conclusion")
-            for cr in (rec.get("check_runs") or [])
-            if cr.get("conclusion")
-        ]
-        if not conclusions:
-            ci_conclusion = "none"
-        elif all(c == "success" for c in conclusions):
-            ci_conclusion = "success"
-        elif any(c in ("failure", "timed_out", "cancelled") for c in conclusions):
-            ci_conclusion = "failure"
-        else:
-            ci_conclusion = "mixed"
-
-        raw_json = json.dumps(rec)
-
-        cursor.execute(
-            merge_sql,
-            (
-                pr["number"],
-                f"{REPO_OWNER}/{REPO_NAME}",
-                rec.get("linked_issue_number"),
-                pr_title,
-                state,
-                is_merged,
-                base_sha,
-                head_sha,
-                changed_files,
-                review_count,
-                ci_conclusion,
-                merged_at,
-                created_at,
-                raw_json,
-            ),
-        )
-
-
-# ============================================================================
-# ISSUE DETAIL FETCHER
-# ============================================================================
-
-def _fetch_issue_full(session, issue_number):
-    base = f"{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}"
-
-    issue = _github_request(session, f"{base}/issues/{issue_number}")
+async def _fetch_issue_full_async(client, num):
+    """Signals: Timeline friction, comment gaps [cite: 75, 84-87]"""
+    base = f"{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/issues/{num}"
+    tasks = [client.request(base), client.request(f"{base}/comments"), 
+             client.request(f"{base}/timeline"), client.request(f"{base}/sub_issues")]
+    issue, comments, timeline, sub_issues = await asyncio.gather(*tasks, return_exceptions=True)
+    
     if not isinstance(issue, dict):
-        logging.warning(f"Issue #{issue_number} returned non-dict response; skipping issue.")
+        logging.warning(f"Issue #{num} returned non-dict response; skipping.")
         return None
-    comments = list(_paginate(session, f"{base}/issues/{issue_number}/comments"))
+        
+    linked_prs = []
+    fix_p = re.compile(r"(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*#(\d+)", re.IGNORECASE)
+    body = (issue.get("body") or "") + " ".join([c.get("body", "") for c in (comments or []) if isinstance(c, dict)])
+    linked_prs.extend([int(m.group(1)) for m in fix_p.finditer(body)])
+    
+    label_names = [l.get("name") for l in issue.get("labels", []) if isinstance(l, dict) and l.get("name")] if isinstance(issue, dict) else []
+    
+    return {"issue": issue, "comments": comments, "timeline": timeline, "sub_issues": sub_issues, 
+            "linked_pr_numbers": list(set(linked_prs)), "issue_number": num, "repo": f"{REPO_OWNER}/{REPO_NAME}", 
+            "label_names": label_names, "extracted_at": datetime.utcnow().isoformat()}
 
-    sub_issues = _github_request(session, f"{base}/issues/{issue_number}/sub_issues")
-    if not isinstance(sub_issues, list):
-        sub_issues = []
-
-    timeline = list(
-        _paginate(
-            session,
-            f"{base}/issues/{issue_number}/timeline",
-            extra_params={"per_page": 100},
-        )
-    )
-
-    linked_pr_numbers = []
-    for event in timeline:
-        if not isinstance(event, dict):
-            continue
-        event_type = event.get("event", "")
-        if event_type == "cross-referenced":
-            src = event.get("source", {})
-            issue_ref = src.get("issue", {})
-            pull_request = issue_ref.get("pull_request")
-            if pull_request:
-                ref_number = issue_ref.get("number")
-                if ref_number:
-                    linked_pr_numbers.append(ref_number)
-
-        if event_type in ("connected", "disconnected"):
-            ref = event.get("source", {})
-            ref_number = ref.get("issue", {}).get("number")
-            if ref_number:
-                linked_pr_numbers.append(ref_number)
-
-    import re
-
-    fix_pattern = re.compile(
-        r"(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*#(\d+)", re.IGNORECASE
-    )
-    body_text = (issue.get("body") or "") + " ".join(c.get("body", "") for c in comments)
-    for match in fix_pattern.finditer(body_text):
-        linked_pr_numbers.append(int(match.group(1)))
-
-    linked_pr_numbers = list(set(linked_pr_numbers))
-
-    return {
-        "issue": issue,
-        "comments": comments,
-        "sub_issues": sub_issues,
-        "timeline": timeline,
-        "linked_pr_numbers": linked_pr_numbers,
-        "issue_number": issue_number,
-        "repo": f"{REPO_OWNER}/{REPO_NAME}",
-        "_extracted_at": datetime.utcnow().isoformat(),
-    }
-
-
-# ============================================================================
-# PR DETAIL FETCHER
-# ============================================================================
-
-def _fetch_pr_full(session, pr_number, linked_issue_number=None):
-    base = f"{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}"
-
-    pr = _github_request(session, f"{base}/pulls/{pr_number}")
-    if not isinstance(pr, dict) or not pr.get("number"):
-        logging.warning(f"PR #{pr_number} returned no data — skipping")
-        return None
-
-    files = list(_paginate(session, f"{base}/pulls/{pr_number}/files"))
-    reviews = list(_paginate(session, f"{base}/pulls/{pr_number}/reviews"))
-    review_comments = list(_paginate(session, f"{base}/pulls/{pr_number}/comments"))
-    commits = list(_paginate(session, f"{base}/pulls/{pr_number}/commits"))
-
+async def _fetch_pr_full_async(client, num, linked_issue=None):
+    """Signals: Unified Diffs (Patcher) and Review Bodies (Critic) [cite: 148, 162-163]"""
+    base = f"{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{num}"
+    tasks = [client.request(base), client.request(f"{base}/files"), 
+             client.request(f"{base}/reviews"), client.request(f"{base}/comments"),
+             client.request(f"{base}/commits"), client.request(f"{base}/requested_reviewers")]
+    pr, files, reviews, r_comments, commits, req_reviewers = await asyncio.gather(*tasks, return_exceptions=True)
+    
     check_runs = []
-    head_sha = pr.get("head", {}).get("sha")
-    if head_sha:
-        result = _github_request(
-            session,
-            f"{base}/commits/{head_sha}/check-runs",
-            params={"per_page": 100},
-        )
-        if isinstance(result, dict):
-            check_runs = result.get("check_runs", [])
-        elif isinstance(result, list):
-            check_runs = result
+    ci_conclusion = "none"
+    if pr and isinstance(pr, dict) and pr.get("head", {}).get("sha"):
+        res = await client.request(f"{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/commits/{pr['head']['sha']}/check-runs")
+        check_runs = res.get("check_runs", []) if res else []
+        conclusions = [cr.get("conclusion") for cr in check_runs if isinstance(cr, dict) and cr.get("conclusion")]
+        if not conclusions: ci_conclusion = "none"
+        elif all(c == "success" for c in conclusions): ci_conclusion = "success"
+        elif any(c in ("failure", "timed_out", "cancelled") for c in conclusions): ci_conclusion = "failure"
+        else: ci_conclusion = "mixed"
 
-    requested_reviewers = _github_request(
-        session, f"{base}/pulls/{pr_number}/requested_reviewers"
-    )
-    if not isinstance(requested_reviewers, dict):
-        requested_reviewers = {"users": [], "teams": []}
+    req_reviewers = req_reviewers if isinstance(req_reviewers, dict) else {"users": [], "teams": []}
+    reviews = reviews if isinstance(reviews, list) else []
+    
+    reviewers_who_submitted = {r.get("user", {}).get("login") for r in reviews if isinstance(r, dict) and r.get("user")}
+    requested_logins = [u.get("login") for u in req_reviewers.get("users", [])]
+    silent_reviewers = [login for login in requested_logins if login not in reviewers_who_submitted]
 
-    reviewers_who_submitted = {
-        r.get("user", {}).get("login") for r in reviews if r.get("user")
-    }
-    requested_logins = [u.get("login") for u in requested_reviewers.get("users", [])]
-    silent_reviewers = [
-        login for login in requested_logins if login not in reviewers_who_submitted
-    ]
-
-    return {
-        "pr": pr,
-        "files": files,
-        "reviews": reviews,
-        "review_comments": review_comments,
-        "commits": commits,
-        "check_runs": check_runs,
-        "requested_reviewers": requested_reviewers,
-        "silent_reviewers": silent_reviewers,
-        "linked_issue_number": linked_issue_number,
-        "pr_number": pr_number,
-        "repo": f"{REPO_OWNER}/{REPO_NAME}",
-        "_extracted_at": datetime.utcnow().isoformat(),
-    }
-
+    return {"pr": pr, "files": files, "reviews": reviews, "review_comments": r_comments, 
+            "commits": commits, "requested_reviewers": req_reviewers, "silent_reviewers": silent_reviewers,
+            "check_runs": check_runs, "ci_conclusion": ci_conclusion, "linked_issue_number": linked_issue, 
+            "pr_number": num, "repo": f"{REPO_OWNER}/{REPO_NAME}", "extracted_at": datetime.utcnow().isoformat()}
 
 # ============================================================================
-# TASK 1 — EXTRACT ISSUES (Production)
+# TASK DEFINITIONS
 # ============================================================================
 
 def extract_issues(**context):
-    params = context["params"]
-    issues_pull_size = params["issues_pull_size"]
-    database = params["snowflake_database"]
-    schema = params["snowflake_schema"]
-    issues_table = params.get("issues_table", ISSUES_TABLE)
-    prs_table = params.get("prs_table", PRS_TABLE)
-    backup_local = params.get("backup_local", False)
+    async def _run():
+        params = context["params"]
+        sink_mode = params.get("sink_mode", "snowflake")
+        client = GitHubAsyncClient(_get_github_token())
 
-    dag_run = context.get("dag_run")
-    run_id = getattr(dag_run, "run_id", "manual")
-    started_at = datetime.utcnow()
+        # Checkpoints — persisted to Docker volume, survives restarts
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        processed = set(json.load(open(CHECKPOINT_DIR / "issues_processed.json")) if (CHECKPOINT_DIR / "issues_processed.json").exists() else [])
+        linked_prs = json.load(open(CHECKPOINT_DIR / "linked_pr_numbers.json")) if (CHECKPOINT_DIR / "linked_pr_numbers.json").exists() else {}
+        logging.info(f"=== extract_issues START [sink={sink_mode}]: checkpoint has {len(processed)} issues already done. Targeting {params['issues_pull_size']} total. ===")
 
-    logging.info("=" * 60)
-    logging.info("EXTRACT ISSUES — PRODUCTION")
-    logging.info(f"Repo: {REPO_OWNER}/{REPO_NAME}")
-    logging.info(f"Target: up to {issues_pull_size} closed issues (excluding PRs)")
-    logging.info(f"Snowflake target: {database}.{schema}")
-    logging.info(f"Tables: {issues_table}, {prs_table}")
-    logging.info(f"Backup local: {backup_local}")
-    logging.info(f"Run id: {run_id}")
-    logging.info(f"Start time (UTC): {started_at.isoformat()}Z")
-    logging.info("=" * 60)
-
-    token = _get_github_token()
-    session = _build_session(token)
-
-    conn, cursor = _get_snowflake_conn(database, schema)
-    _ensure_tables(cursor, database, schema, issues_table, prs_table)
-
-    checkpoint_key = "issues_processed"
-    pr_checkpoint_key = "linked_pr_numbers"
-
-    processed_numbers = set(_load_checkpoint(checkpoint_key) or [])
-    all_linked_prs = dict(_load_checkpoint(pr_checkpoint_key) or {})
-    processed_at_start = len(processed_numbers)
-
-    remaining_quota = max(issues_pull_size - len(processed_numbers), 0)
-    logging.info(
-        f"Checkpoint: {len(processed_numbers)} issues already processed "
-        f"(remaining_quota={remaining_quota})"
-    )
-
-    list_url = f"{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/issues"
-    list_params = {"state": "closed", "sort": "created", "direction": "desc"}
-
-    issue_numbers_to_process = []
-    logging.info("Fetching issue list...")
-
-    # NOTE: GitHub's /issues endpoint includes PRs; filter them out by checking
-    # the presence of the "pull_request" key.
-    scanned = 0
-    if remaining_quota > 0:
-        for item in _paginate(session, list_url, list_params, max_items=None):
-            scanned += 1
-            num = item.get("number")
-            if not num or num in processed_numbers:
-                continue
-            created_at = item.get("created_at", "")
-            if created_at < "2019-01-01T00:00:00Z":
-                logging.info(f"Hit pre-2019 issue #{num} (created {created_at[:10]}) — stopping scan")
-                break  # All remaining pages are older, no need to fetch them
-            issue_numbers_to_process.append(num)
-            if len(issue_numbers_to_process) >= remaining_quota:
+        # GraphQL Discovery
+        query = "query($o:String!,$n:String!,$c:String){repository(owner:$o,name:$n){issues(states:CLOSED,first:100,after:$c,orderBy:{field:CREATED_AT,direction:DESC}){pageInfo{hasNextPage,endCursor}nodes{number,createdAt}}}}"
+        nums, cursor = [], None
+        while len(nums) < params["issues_pull_size"]:
+            data = await client.request(f"{GITHUB_API_BASE}/graphql", method="POST", json_data={"query":query,"variables":{"o":REPO_OWNER,"n":REPO_NAME,"c":cursor}})
+            if not data or not data.get("data"):
+                logging.error(f"GraphQL discovery returned empty response (cursor={cursor}). Stopping discovery.")
                 break
+            nodes = data["data"]["repository"]["issues"]["nodes"]
+            last_node = None
+            for n in nodes:
+                last_node = n
+                if n["createdAt"] < "2019-01-01T00:00:00Z": break
+                nums.append(n["number"])
+            page_info = data["data"]["repository"]["issues"]["pageInfo"]
+            if not page_info["hasNextPage"] or (last_node and last_node["createdAt"] < "2019-01-01T00:00:00Z"): break
+            cursor = page_info["endCursor"]
 
-    logging.info(
-        f"Found {len(issue_numbers_to_process)} new issues to process "
-        f"(scanned_items={scanned})"
-    )
+        nums = [n for n in nums if n not in processed]
+        logging.info(f"Discovery complete: {len(nums)} issues remaining to fetch after checkpoint filter.")
 
-    batch = []
-    BATCH_SIZE = 50
-    total = len(issue_numbers_to_process)
-    backup_records = [] if backup_local else None
+        for i in range(0, len(nums), 100):
+            chunk = nums[i:i+100]
+            results = await asyncio.gather(*[_fetch_issue_full_async(client, n) for n in chunk])
+            batch = [r for r in results if r and isinstance(r, dict)]
+            for r in batch:
+                linked_prs[str(r["issue"]["number"])] = r["linked_pr_numbers"]
+                processed.add(r["issue"]["number"])
 
-    for idx, issue_number in enumerate(issue_numbers_to_process):
-        try:
-            if idx == 0:
-                logging.info(f"Beginning issue detail fetch for {total} issues...")
-            logging.info(f"  Issue {idx+1}/{total}: #{issue_number}")
-            record = _fetch_issue_full(session, issue_number)
-            if record is None:
-                continue
+            if sink_mode == "local":
+                _write_local(params["issues_table"], batch)
+            else:
+                _bulk_load_snowflake(params["issues_table"], batch, params["snowflake_database"], params["snowflake_schema"])
 
-            if record.get("linked_pr_numbers"):
-                all_linked_prs[str(issue_number)] = record["linked_pr_numbers"]
-                if (idx + 1) % 25 == 0:
-                    logging.info(
-                        f"  Linked PR refs so far: {sum(len(v) for v in all_linked_prs.values())} "
-                        f"across {len(all_linked_prs)} issues"
-                    )
+            json.dump(list(processed), open(CHECKPOINT_DIR / "issues_processed.json", "w"))
+            json.dump(linked_prs, open(CHECKPOINT_DIR / "linked_pr_numbers.json", "w"))
+            remaining = max(len(nums) - (i + 100), 0)
+            sink_label = "JSONL" if sink_mode == "local" else "Snowflake"
+            logging.info(f"Progress: {len(processed)} issues total processed. Wrote {len(batch)} to {sink_label}. ~{remaining} remaining this run.")
 
-            batch.append(record)
-            if backup_records is not None:
-                backup_records.append(record)
+        logging.info(f"=== extract_issues DONE: {len(processed)} issues total, {sum(len(v) for v in linked_prs.values())} linked PR refs found. ===")
 
-            if len(batch) >= BATCH_SIZE:
-                _upsert_issues_batch(cursor, database, schema, issues_table, batch)
-                conn.commit()
-                logging.info(f"  Flushed batch of {len(batch)} to Snowflake")
-                batch = []
-
-            processed_numbers.add(issue_number)
-            _save_checkpoint(checkpoint_key, list(processed_numbers))
-            _save_checkpoint(pr_checkpoint_key, all_linked_prs)
-
-            time.sleep(0.5)
-
-        except Exception as e:
-            logging.error(f"  Failed on issue #{issue_number}: {e}")
-            _save_checkpoint(checkpoint_key, list(processed_numbers))
-            _save_checkpoint(pr_checkpoint_key, all_linked_prs)
-            continue
-
-    if batch:
-        _upsert_issues_batch(cursor, database, schema, issues_table, batch)
-        conn.commit()
-        logging.info(f"Flushed final batch of {len(batch)} issues")
-
-    # Optional local backup
-    if backup_records is not None:
-        backup_dir = BACKUP_ROOT / run_id
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        issues_path = backup_dir / "issues.json"
-        with open(issues_path, "w") as f:
-            json.dump(backup_records, f, indent=2, default=str)
-        logging.info(f"Local backup written: {issues_path} ({len(backup_records)} issues)")
-
-    total_linked_prs = sum(len(v) for v in all_linked_prs.values())
-    finished_at = datetime.utcnow()
-    duration_s = (finished_at - started_at).total_seconds()
-    processed_in_run = len(processed_numbers) - processed_at_start
-
-    logging.info("=" * 60)
-    logging.info("EXTRACT ISSUES — COMPLETE")
-    logging.info(f"Issues extracted (cumulative): {len(processed_numbers)}")
-    logging.info(f"Issues extracted (this run): {processed_in_run}")
-    logging.info(f"Unique issues with linked PRs: {len(all_linked_prs)}")
-    logging.info(f"Total linked PR references: {total_linked_prs}")
-    logging.info(f"End time (UTC): {finished_at.isoformat()}Z (duration={duration_s:.1f}s)")
-    logging.info("Issues extract complete. PR numbers saved to checkpoint.")
-    logging.info("=" * 60)
-
-    conn.close()
-
-
-# ============================================================================
-# TASK 2 — EXTRACT PRS (Production)
-# ============================================================================
+    asyncio.run(_run())
 
 def extract_prs(**context):
-    params = context["params"]
-    prs_pull_size = params["prs_pull_size"]
-    database = params["snowflake_database"]
-    schema = params["snowflake_schema"]
-    issues_table = params.get("issues_table", ISSUES_TABLE)
-    prs_table = params.get("prs_table", PRS_TABLE)
-    backup_local = params.get("backup_local", False)
+    async def _run():
+        params = context["params"]
+        sink_mode = params.get("sink_mode", "snowflake")
+        client = GitHubAsyncClient(_get_github_token())
 
-    dag_run = context.get("dag_run")
-    run_id = getattr(dag_run, "run_id", "manual")
-    started_at = datetime.utcnow()
+        # Load linked_pr_numbers for supplementary issue→PR enrichment (best-effort)
+        linked_data = json.load(open(CHECKPOINT_DIR / "linked_pr_numbers.json")) \
+            if (CHECKPOINT_DIR / "linked_pr_numbers.json").exists() else {}
+        pr_to_issue = {p: int(i) for i, prs in linked_data.items() for p in prs}
 
-    logging.info("=" * 60)
-    logging.info("EXTRACT PRS — PRODUCTION")
-    logging.info(f"Repo: {REPO_OWNER}/{REPO_NAME}")
-    logging.info(f"Snowflake target: {database}.{schema}")
-    logging.info(f"Tables: {issues_table}, {prs_table}")
-    logging.info(f"Backup local: {backup_local}")
-    logging.info(f"Run id: {run_id}")
-    logging.info(f"Start time (UTC): {started_at.isoformat()}Z")
-    logging.info("=" * 60)
+        # === GraphQL Discovery: enumerate ALL closed+merged PRs directly ===
+        # Most PRs are NOT linked via "fixes #N" keywords in issue bodies.
+        # The correct approach is direct enumeration, same as extract_issues.
+        #
+        # RESILIENCE: After a successful discovery, the full PR list is cached to
+        # CHECKPOINT_DIR/pr_discovery_cache.json. On retry, if GraphQL fails (e.g. network
+        # down at task startup), we fall back to the cache — preventing the false-success
+        # where 0 PRs are discovered and the task exits claiming it is done.
+        PR_DISCOVERY_CACHE = CHECKPOINT_DIR / "pr_discovery_cache.json"
 
-    token = _get_github_token()
-    session = _build_session(token)
+        pr_query = "query($o:String!,$n:String!,$c:String){repository(owner:$o,name:$n){pullRequests(states:[CLOSED,MERGED],first:100,after:$c,orderBy:{field:CREATED_AT,direction:DESC}){pageInfo{hasNextPage,endCursor}nodes{number,createdAt}}}}"
+        all_pr_nums, cursor = [], None
+        while len(all_pr_nums) < params["prs_pull_size"]:
+            data = await client.request(
+                f"{GITHUB_API_BASE}/graphql", method="POST",
+                json_data={"query": pr_query, "variables": {"o": REPO_OWNER, "n": REPO_NAME, "c": cursor}}
+            )
+            if not data or not data.get("data"):
+                logging.error(f"GraphQL PR discovery returned empty response (cursor={cursor}). Stopping discovery.")
+                break
+            nodes = data["data"]["repository"]["pullRequests"]["nodes"]
+            last_node = None
+            for n in nodes:
+                last_node = n
+                if n["createdAt"] < "2019-01-01T00:00:00Z": break
+                all_pr_nums.append(n["number"])
+            page_info = data["data"]["repository"]["pullRequests"]["pageInfo"]
+            if not page_info["hasNextPage"] or (last_node and last_node["createdAt"] < "2019-01-01T00:00:00Z"): break
+            cursor = page_info["endCursor"]
 
-    all_linked_prs = dict(_load_checkpoint("linked_pr_numbers") or {})
-    if not all_linked_prs:
-        logging.warning(
-            "No linked PRs found in checkpoint. Did extract_issues complete successfully?"
-        )
-        return
-
-    pr_to_issues = {}
-    for issue_str, pr_list in all_linked_prs.items():
-        for pr_num in pr_list:
-            pr_to_issues.setdefault(pr_num, []).append(int(issue_str))
-
-    unique_pr_numbers = sorted(pr_to_issues.keys())
-
-    if len(unique_pr_numbers) > prs_pull_size:
-        logging.info(
-            f"Capping PR pull at {prs_pull_size} (found {len(unique_pr_numbers)} linked)"
-        )
-        unique_pr_numbers = unique_pr_numbers[:prs_pull_size]
-
-    logging.info(
-        f"Unique PRs to fetch: {len(unique_pr_numbers)} "
-        f"(from {len(all_linked_prs)} issues with PR links)"
-    )
-
-    conn, cursor = _get_snowflake_conn(database, schema)
-    _ensure_tables(cursor, database, schema, issues_table, prs_table)
-
-    pr_checkpoint_key = "prs_processed"
-    processed_prs = set(_load_checkpoint(pr_checkpoint_key) or [])
-    processed_prs_at_start = len(processed_prs)
-    logging.info(f"Checkpoint: {len(processed_prs)} PRs already processed")
-
-    prs_to_process = [p for p in unique_pr_numbers if p not in processed_prs]
-    logging.info(f"PRs remaining: {len(prs_to_process)}")
-
-    batch = []
-    BATCH_SIZE = 25
-    total = len(prs_to_process)
-    backup_records = [] if backup_local else None
-
-    for idx, pr_number in enumerate(prs_to_process):
-        linked_issue = pr_to_issues.get(pr_number, [None])[0]
-
-        try:
-            if idx == 0:
-                logging.info(f"Beginning PR detail fetch for {total} PRs...")
-            logging.info(f"  PR {idx+1}/{total}: #{pr_number} (linked to issue #{linked_issue})")
-            record = _fetch_pr_full(session, pr_number, linked_issue)
-
-            # Only mark PR as processed if we successfully fetched a full PR record
-            # and will therefore write it to Snowflake.
-            if record is None:
+        if all_pr_nums:
+            # Successful discovery — persist to cache so future retries can fall back
+            json.dump(all_pr_nums, open(PR_DISCOVERY_CACHE, "w"))
+            logging.info(f"PR Discovery complete: {len(all_pr_nums)} total PRs found via GraphQL. Cache updated.")
+        else:
+            # Discovery failed (network down) — load cached list from previous successful run
+            if PR_DISCOVERY_CACHE.exists():
+                all_pr_nums = json.load(open(PR_DISCOVERY_CACHE))
                 logging.warning(
-                    f"PR #{pr_number} was not fully fetched (record=None); "
-                    f"leaving it unprocessed for retry."
+                    f"GraphQL discovery returned 0 PRs (network issue?). "
+                    f"Falling back to cached discovery list: {len(all_pr_nums)} PRs."
                 )
-                continue
+            else:
+                raise RuntimeError(
+                    "GraphQL PR discovery failed (network unreachable) AND no local cache exists. "
+                    "Fix network connectivity and retrigger the task."
+                )
 
-            batch.append(record)
-            if backup_records is not None:
-                backup_records.append(record)
+        processed = set(json.load(open(CHECKPOINT_DIR / "prs_processed.json")) if (CHECKPOINT_DIR / "prs_processed.json").exists() else [])
+        pr_list = [p for p in all_pr_nums if p not in processed]
 
-            if len(batch) >= BATCH_SIZE:
-                _upsert_prs_batch(cursor, database, schema, prs_table, batch)
-                conn.commit()
-                logging.info(f"  Flushed batch of {len(batch)} PRs to Snowflake")
-                batch = []
+        logging.info(
+            f"=== extract_prs START [sink={sink_mode}]: discovered {len(all_pr_nums)} PRs. "
+            f"Checkpoint has {len(processed)} done. {len(pr_list)} remaining to fetch. ==="
+        )
 
-            processed_prs.add(pr_number)
-            _save_checkpoint(pr_checkpoint_key, list(processed_prs))
+        for i in range(0, len(pr_list), 100):
+            chunk = pr_list[i:i+100]
+            results = await asyncio.gather(*[_fetch_pr_full_async(client, p, pr_to_issue.get(p)) for p in chunk])
+            batch = [r for r in results if r and isinstance(r.get("pr"), dict) and r["pr"].get("number")]
+            for r in batch:
+                processed.add(r["pr"]["number"])
 
-            time.sleep(0.5)
+            if sink_mode == "local":
+                _write_local(params["prs_table"], batch)
+            else:
+                _bulk_load_snowflake(params["prs_table"], batch, params["snowflake_database"], params["snowflake_schema"])
 
-        except Exception as e:
-            logging.error(f"  Failed on PR #{pr_number}: {e}")
-            _save_checkpoint(pr_checkpoint_key, list(processed_prs))
-            continue
+            json.dump(list(processed), open(CHECKPOINT_DIR / "prs_processed.json", "w"))
+            remaining = max(len(pr_list) - (i + 100), 0)
+            sink_label = "JSONL" if sink_mode == "local" else "Snowflake"
+            logging.info(f"Progress: {len(processed)} PRs total processed. Wrote {len(batch)} to {sink_label}. ~{remaining} remaining this run.")
 
-    if batch:
-        _upsert_prs_batch(cursor, database, schema, prs_table, batch)
-        conn.commit()
-        logging.info(f"Flushed final batch of {len(batch)} PRs")
+        logging.info(f"=== extract_prs DONE: {len(processed)} PRs total processed. ===")
 
-    if len(processed_prs) >= len(unique_pr_numbers):
-        logging.info("All PRs processed. Clearing PR checkpoint.")
-        _clear_checkpoint(pr_checkpoint_key)
-
-    # Optional local backup
-    if backup_records is not None:
-        backup_dir = BACKUP_ROOT / run_id
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        prs_path = backup_dir / "prs.json"
-        with open(prs_path, "w") as f:
-            json.dump(backup_records, f, indent=2, default=str)
-        logging.info(f"Local backup written: {prs_path} ({len(backup_records)} PRs)")
-
-    logging.info("=" * 60)
-    logging.info("EXTRACT PRS — COMPLETE")
-    logging.info(f"PRs extracted (cumulative): {len(processed_prs)}")
-    logging.info(f"PRs extracted (this run): {len(processed_prs) - processed_prs_at_start}")
-    finished_at = datetime.utcnow()
-    duration_s = (finished_at - started_at).total_seconds()
-    logging.info(f"End time (UTC): {finished_at.isoformat()}Z (duration={duration_s:.1f}s)")
-    logging.info("PRs extract complete.")
-    logging.info("=" * 60)
-
-    conn.close()
-
+    asyncio.run(_run())
 
 # ============================================================================
-# DAG DEFINITION
+# DAG DEFINITION (Original Descriptions & Hints)
 # ============================================================================
 
 with DAG(
     dag_id="full_extract",
     default_args=default_args,
-    description=(
-        "Full GitHub extract: closed issues + linked PRs from apache/airflow into Snowflake RAW"
-    ),
+    description="Full GitHub extract: closed issues + linked PRs from apache/airflow into Snowflake RAW",
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
-    catchup=False,
-    tags=["extract", "github", "snowflake", "raw"],
     params={
-        "issues_pull_size": Param(
-            15000,
-            type="integer",
-            description="Max closed issues to pull (15000 ≈ everything).",
-        ),
-        "prs_pull_size": Param(
-            50000,
-            type="integer",
-            description="Safety cap on linked PRs to detail-fetch.",
-        ),
-        "snowflake_database": Param(
-            "AIRFLOW_ML",
-            type="string",
-            description="Target Snowflake database.",
-        ),
-        "snowflake_schema": Param(
-            "RAW",
-            type="string",
-            description="Target Snowflake schema.",
-        ),
-        "issues_table": Param(
-            ISSUES_TABLE,
-            type="string",
-            description="Target Snowflake issues table name.",
-        ),
-        "prs_table": Param(
-            PRS_TABLE,
-            type="string",
-            description="Target Snowflake PRs table name.",
-        ),
-        "backup_local": Param(
-            False,
-            type="boolean",
-            description=(
-                "If True: also write local JSON backups under "
-                "/opt/airflow/code_v2/backups/full_extract/{run_id}/issues.json and prs.json."
-            ),
-        ),
-    },
+        "sink_mode": Param("local", type="string", description="'local' = write JSONL to Docker volume (travel/unstable network). 'snowflake' = load to Snowflake."),
+        "issues_pull_size": Param(60000, type="integer", description="Max closed issues to pull (post-2019)."),
+        "prs_pull_size": Param(60000, type="integer", description="Safety cap on linked PRs."),
+        "snowflake_database": Param("AIRFLOW_ML", type="string", description="Target Snowflake database."),
+        "snowflake_schema": Param("RAW", type="string", description="Target Snowflake schema."),
+        "issues_table": Param(ISSUES_TABLE, type="string", description="Target Snowflake issues table name."),
+        "prs_table": Param(PRS_TABLE, type="string", description="Target Snowflake PRs table name."),
+    }
 ) as dag:
-    extract_issues_task = PythonOperator(
-        task_id="extract_issues",
-        python_callable=extract_issues,
-        provide_context=True,
-    )
-
-    extract_prs_task = PythonOperator(
-        task_id="extract_prs",
-        python_callable=extract_prs,
-        provide_context=True,
-    )
-
-    extract_issues_task >> extract_prs_task
-
+    t1 = PythonOperator(task_id="extract_issues", python_callable=extract_issues)
+    t2 = PythonOperator(task_id="extract_prs", python_callable=extract_prs)
+    t1 >> t2

@@ -1,0 +1,35 @@
+# 1) Go to the tree_sitter folder (script + output now live here)
+cd "/Users/shatayu/Desktop/FALL24/SPRING26/298B/WB2/tree_sitter"
+
+# 2) Create and activate a dedicated venv for tree-sitter work
+python3 -m venv .venv-treesitter
+source .venv-treesitter/bin/activate
+
+# 3) Upgrade packaging tools
+python -m pip install --upgrade pip setuptools wheel
+
+# 4) Install tree-sitter deps
+pip install "tree-sitter>=0.21.0" tree-sitter-python
+
+# 5) Clone Airflow here (skip if already cloned)
+git clone https://github.com/apache/airflow.git
+
+# 6) Build index
+# Output is written to gitignored folder under autobot_dev:
+#   autobot_dev/cli/patch_planner/treesitter/outputs/treesitter_index.json
+python "/Users/shatayu/Desktop/FALL24/SPRING26/298B/WB2/autobot_dev/cli/patch_planner/treesitter/build_treesitter_index.py" \
+  --repo ./airflow \
+  --output "/Users/shatayu/Desktop/FALL24/SPRING26/298B/WB2/autobot_dev/cli/patch_planner/treesitter/outputs/treesitter_index.json"
+
+
+## If Airflow is already cloned in ./airflow (use only)
+cd "/Users/shatayu/Desktop/FALL24/SPRING26/298B/WB2/tree_sitter"
+source .venv-treesitter/bin/activate
+python -m pip install --upgrade pip
+pip install "tree-sitter>=0.21.0" tree-sitter-python
+python "/Users/shatayu/Desktop/FALL24/SPRING26/298B/WB2/autobot_dev/cli/patch_planner/treesitter/build_treesitter_index.py" \
+  --repo ./airflow \
+  --output "/Users/shatayu/Desktop/FALL24/SPRING26/298B/WB2/autobot_dev/cli/patch_planner/treesitter/outputs/treesitter_index.json"
+
+Note: Output: treesitter_index.json (~3–6 MB).
+Upload this to Colab before running Cell 5 of planner training script.

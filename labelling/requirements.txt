@@ -1,4 +1,0 @@
-# AutoBot Label Pipeline — Python dependencies
-# Install with: pip install -r requirements_label.txt
-
-openai>=1.30.0          # GPT-4o API calls (scorer, reasoner, critic)

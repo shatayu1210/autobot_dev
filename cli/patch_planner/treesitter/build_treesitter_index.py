@@ -45,9 +45,10 @@ def main() -> None:
     else:
         output_path = outputs_dir / "treesitter_index.json"
 
-    # Original implementation lives in WB2/tree_sitter/build_treesitter_index.py
-    # Wrapper location: WB2/autobot_dev/cli/patch_planner/treesitter/build_treesitter_index.py
-    old_impl = this_dir.parents[4] / "tree_sitter" / "build_treesitter_index.py"
+    # Original implementation lives in autobot_dev/tree_sitter/build_treesitter_index.py
+    # Wrapper location: autobot_dev/cli/patch_planner/treesitter/build_treesitter_index.py
+    autobot_dev_root = this_dir.parents[2]
+    old_impl = autobot_dev_root / "tree_sitter" / "build_treesitter_index.py"
     if not old_impl.exists():
         raise FileNotFoundError(f"Expected implementation not found: {old_impl}")
 

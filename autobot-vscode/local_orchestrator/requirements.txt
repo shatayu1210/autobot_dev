@@ -1,0 +1,5 @@
+flask>=3.0.0
+python-dotenv>=1.0.0
+langchain-core>=1.2.13
+langchain-google-genai>=2.0.0
+google-cloud-aiplatform>=1.138.0

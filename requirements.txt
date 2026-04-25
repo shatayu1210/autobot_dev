@@ -1,0 +1,22 @@
+# Core dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+PyJWT
+cryptography
+
+# Data processing and DB Connectors
+pandas>=2.0.0
+snowflake-connector-python>=3.0.0
+tqdm==4.66.1
+
+# GraphRAG Database Driver & Local Embeddings
+neo4j>=5.18.0
+sentence-transformers>=3.0.0
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0
+
+# LLM API dependencies
+openai>=1.30.0
+
+# Cloud Storage
+google-cloud-storage>=2.10.0
