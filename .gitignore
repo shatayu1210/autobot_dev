@@ -239,7 +239,6 @@ slackbot/.git/
 graphrag/data/
 graphrag/logs/
 etl/extracted_data/
-etl/training_data/
 etl/checkpoints/
 temp_check/
 tree_sitter/airflow/
@@ -250,3 +249,6 @@ graphrag/plugins/*.jar
 # Generated training corpora snapshots (large)
 training/**/*_train_graphrag*.jsonl
 training/**/*_graphrag_v*.jsonl
+
+# Keep training_data docs, ignore large JSONL payloads
+etl/training_data/*.jsonl
