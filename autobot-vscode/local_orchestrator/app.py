@@ -2,16 +2,15 @@
 Local orchestrator for the AutoBot VS Code extension.
 
 Modes (AUTOBOT_MODE):
-  - google_ai → Google AI Studio API key (GOOGLE_API_KEY); uses ChatGoogleGenerativeAI. No Vertex project needed.
-  - vertex    → Vertex AI GenerativeModel.generateContent (Gemini on Vertex; GCP + ADC).
+  - google_ai → Google AI Studio API key (GOOGLE_API_KEY); uses ChatGoogleGenerativeAI.
+  - vertex    → Vertex AI GenerativeModel.generateContent (GCP + ADC).
   - ollama    → local Ollama.
   - stub      → canned JSON (no LLM).
 
-Google AI Studio (API key): https://aistudio.google.com/apikey — set AUTOBOT_MODE=google_ai and GOOGLE_API_KEY.
+Run with:
+  uvicorn app:app --host 127.0.0.1 --port 5000 --reload
 
-Apache Airflow test (Vertex): clone repo, .env with GCP_* and AUTOBOT_MODE=vertex, gcloud auth application-default login.
-
-POST /api/orchestrate  JSON: { "command": "ask_issue"|"plan_patch"|"accept_plan"|"open_pr", ... }
+POST /api/orchestrate  JSON: { "command": "ask_issue"|"plan_patch"|"accept_plan"|"open_pr"|"query", ... }
 """
 
 from __future__ import annotations
@@ -25,11 +24,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-app = Flask(__name__)
+app = FastAPI(title="AutoBot Local Orchestrator", version="1.0.0")
+
+# Allow the VS Code webview origin (vscode-webview://) and localhost
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 AUTOBOT_MODE = os.environ.get("AUTOBOT_MODE", "stub").lower()
 
@@ -168,11 +177,35 @@ def ollama_available() -> bool:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
+    """Extract a JSON object from text, handling markdown fences and raw JSON."""
     text = text.strip()
+    # Try to find the first '{' and last '}'
+    start = text.find('{')
+    end = text.rfind('}')
+    
+    if start != -1 and end != -1 and end > start:
+        json_str = text[start : end + 1]
+        try:
+            data = json.loads(json_str)
+            if isinstance(data, dict):
+                return data
+            # If it's a list, wrap it or handle it in the caller
+            return {"raw_list": data}
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback to simple load for cases like "```json\n...\n```"
     fence = re.match(r"^```(?:json)?\s*\n([\s\S]*?)\n```\s*$", text)
     if fence:
         text = fence.group(1).strip()
-    return json.loads(text)
+    
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+        return {"raw_list": data} if isinstance(data, list) else {"value": data}
+    except json.JSONDecodeError:
+        raise ValueError(f"Could not parse JSON from: {text[:200]}...")
 
 
 def fetch_github_issue(issue_number: int) -> dict[str, Any] | None:
@@ -270,6 +303,18 @@ def stub_ask_issue(issue_number: int) -> dict[str, Any]:
         "body": "Stub issue — set GITHUB_TOKEN + GITHUB_OWNER/GITHUB_REPO for live GitHub data.",
         "state": "open",
         "html_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/issues/{issue_number}",
+    }
+
+def stub_ask_pr(pr_number: int) -> dict[str, Any]:
+    gh = gh_get_pr(pr_number)
+    if gh:
+        return gh
+    return {
+        "pr_number": pr_number,
+        "title": f"[STUB] PR #{pr_number}",
+        "body": "Stub PR — set GITHUB_TOKEN + GITHUB_OWNER/GITHUB_REPO for live GitHub data.",
+        "state": "open",
+        "html_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/pull/{pr_number}",
     }
 
 
@@ -588,12 +633,422 @@ def _issue_title_body(issue_number: int) -> tuple[str, str]:
     )
 
 
+# ── GitHub REST helpers for adhoc queries ──────────────────────────────────
+
+
+def _github_get(path: str) -> dict | list | None:
+    """Authenticated GET against the GitHub REST API. Returns parsed JSON or None."""
+    if not GITHUB_TOKEN:
+        return None
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/{path.lstrip('/')}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        return None
+
+
+def gh_get_issue(issue_number: int) -> dict | None:
+    """Get a single issue by number."""
+    return _github_get(f"issues/{issue_number}")
+
+
+def gh_get_issue_comments(issue_number: int) -> list | None:
+    """Get comments on an issue."""
+    return _github_get(f"issues/{issue_number}/comments")
+
+
+def gh_get_issue_timeline(issue_number: int) -> list | None:
+    """Get timeline events for an issue."""
+    return _github_get(f"issues/{issue_number}/timeline")
+
+
+def gh_get_pr(pr_number: int) -> dict | None:
+    """Get a single pull request by number."""
+    return _github_get(f"pulls/{pr_number}")
+
+
+def gh_get_pr_files(pr_number: int) -> list | None:
+    """Get files changed by a pull request."""
+    return _github_get(f"pulls/{pr_number}/files")
+
+
+def gh_get_pr_reviews(pr_number: int) -> list | None:
+    """Get reviews on a pull request."""
+    return _github_get(f"pulls/{pr_number}/reviews")
+
+
+def gh_get_pr_commits(pr_number: int) -> list | None:
+    """Get commits in a pull request."""
+    return _github_get(f"pulls/{pr_number}/commits")
+
+
+def gh_get_pr_ci_status(pr_number: int) -> dict | None:
+    """Get CI check-runs for a PR's head SHA."""
+    pr = gh_get_pr(pr_number)
+    if not pr:
+        return None
+    sha = pr.get("head", {}).get("sha", "")
+    if not sha:
+        return None
+    return _github_get(f"commits/{sha}/check-runs")
+
+
+def gh_search_issues(query: str, max_results: int = 10) -> list | None:
+    """Search issues/PRs using GitHub search syntax."""
+    if not GITHUB_TOKEN:
+        return None
+    q = f"repo:{GITHUB_OWNER}/{GITHUB_REPO} {query}"
+    url = f"https://api.github.com/search/issues?q={urllib.request.quote(q)}&per_page={max_results}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("items", [])[:max_results]
+    except urllib.error.HTTPError:
+        return None
+
+
+# ── Tool registry for LLM tool-calling ─────────────────────────────────────
+
+# Each entry: (callable, description_for_llm)
+GITHUB_TOOLS: dict[str, tuple[Any, str]] = {
+    "get_issue": (
+        lambda issue_number: gh_get_issue(int(issue_number)),
+        "Get a GitHub issue by number. Args: issue_number (int)",
+    ),
+    "get_issue_comments": (
+        lambda issue_number: gh_get_issue_comments(int(issue_number)),
+        "Get comments on a GitHub issue. Args: issue_number (int)",
+    ),
+    "get_issue_timeline": (
+        lambda issue_number: gh_get_issue_timeline(int(issue_number)),
+        "Get timeline events for a GitHub issue. Args: issue_number (int)",
+    ),
+    "get_pr": (
+        lambda pr_number: gh_get_pr(int(pr_number)),
+        "Get a GitHub pull request by number. Args: pr_number (int)",
+    ),
+    "get_pr_files": (
+        lambda pr_number: gh_get_pr_files(int(pr_number)),
+        "Get files changed in a pull request. Args: pr_number (int)",
+    ),
+    "get_pr_reviews": (
+        lambda pr_number: gh_get_pr_reviews(int(pr_number)),
+        "Get reviews on a pull request. Args: pr_number (int)",
+    ),
+    "get_pr_commits": (
+        lambda pr_number: gh_get_pr_commits(int(pr_number)),
+        "Get commits in a pull request. Args: pr_number (int)",
+    ),
+    "get_pr_ci_status": (
+        lambda pr_number: gh_get_pr_ci_status(int(pr_number)),
+        "Get CI check-run status for a PR. Args: pr_number (int)",
+    ),
+    "search_issues": (
+        lambda query, max_results=10: gh_search_issues(str(query), int(max_results)),
+        "Search GitHub issues/PRs by keyword. Args: query (str), max_results (int, default 10)",
+    ),
+}
+
+# Add GraphRAG tools if neo4j is available
+try:
+    from graphrag_client import similar_issues, linked_prs_for_issues, neo4j_available as _neo4j_ok
+
+    if _neo4j_ok():
+        GITHUB_TOOLS["graphrag_similar_issues"] = (
+            lambda issue_number, k=5: similar_issues(int(issue_number), int(k)),
+            "Find top-K issues similar to a given issue using GraphRAG vector search. Args: issue_number (int), k (int, default 5)",
+        )
+        GITHUB_TOOLS["graphrag_linked_prs"] = (
+            lambda issue_numbers: linked_prs_for_issues([int(n) for n in issue_numbers]),
+            "Find PRs linked to a list of issue numbers in the graph. Args: issue_numbers (list[int])",
+        )
+except ImportError:
+    pass  # neo4j driver not installed — skip GraphRAG tools
+
+
+# ── Soft guardrail for adhoc queries ───────────────────────────────────────
+
+GUARDRAIL_PROMPT = (
+    "You are a security guardrail. Classify if the user's query is relevant to:\n"
+    "1. GitHub issues, pull requests, commits, code reviews, or CI status.\n"
+    "2. The Apache Airflow software repository.\n"
+    "3. General software engineering tasks within the scope of this project.\n\n"
+    "If it is relevant, output exactly: YES\n"
+    "If it is NOT relevant (e.g. general chat, jokes, recipes, unrelated domains), output exactly: NO"
+)
+
+
+def _hyperlink_refs(text: str) -> str:
+    """Replace bare #N references with HTML anchors linking to GitHub."""
+    base = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+    text = re.sub(
+        r"(?<!\w)#(\d{3,6})(?!\w)",
+        lambda m: f'<a href="{base}/issues/{m.group(1)}">#{m.group(1)}</a>',
+        text,
+    )
+    text = re.sub(
+        r"\bPR #(\d{3,6})\b",
+        lambda m: f'<a href="{base}/pull/{m.group(1)}">PR #{m.group(1)}</a>',
+        text,
+    )
+    return text
+
+
+from fastapi.responses import JSONResponse, StreamingResponse
+import asyncio
+
+async def llm_adhoc_query_stream(chat_fn: Callable[[str, str], str], user_query: str):
+    """Streaming version of adhoc query."""
+    def yield_event(event_type: str, data: dict):
+        payload = json.dumps({"type": event_type, **data})
+        return f"data: {payload}\n\n"
+
+    # Pass 0: Soft guardrail
+    yield yield_event("step", {"msg": "Checking query relevance..."})
+    await asyncio.sleep(0.01) # Yield to event loop
+    relevance = await asyncio.to_thread(chat_fn, GUARDRAIL_PROMPT, user_query)
+    relevance = relevance.strip().upper()
+    
+    if "NO" in relevance and "YES" not in relevance:
+        ans = (
+            "I am AutoBot, an assistant dedicated to the Apache Airflow repository. "
+            "I can help with GitHub issues, PRs, CI status, code reviews, and repository queries. "
+            "I'm unable to assist with questions outside this scope."
+        )
+        yield yield_event("done", {"answer": ans, "tools_called": [], "guardrail_blocked": True})
+        return
+
+    # Pass 1: Plan
+    yield yield_event("step", {"msg": "Planning tool execution..."})
+    await asyncio.sleep(0.01)
+    tool_descriptions = "\n".join(f"- {name}: {desc}" for name, (_, desc) in GITHUB_TOOLS.items())
+    plan_system = (
+        "You are a tool-calling planner for GitHub queries about apache/airflow.\n"
+        "Available tools:\n"
+        f"{tool_descriptions}\n\n"
+        "Given the user's question, output a JSON object with a 'calls' array.\n"
+        "Each call: {\"tool\": \"<name>\", \"args\": {\"<param>\": <value>}}.\n"
+        "Max 5 calls. If the question can be answered with fewer, use fewer.\n"
+        "Output JSON only — no commentary, no markdown fences."
+    )
+    raw_plan = await asyncio.to_thread(chat_fn, plan_system, user_query)
+
+    plan_data = extract_json_object(raw_plan)
+    calls = plan_data.get("calls", [])
+    if not isinstance(calls, list):
+        calls = []
+
+    tool_results = []
+    tools_called = []
+
+    if not calls:
+        yield yield_event("step", {"msg": "No tools needed, answering directly..."})
+    else:
+        for call in calls:
+            tool_name = call.get("tool")
+            args = call.get("args", {})
+            if tool_name not in GITHUB_TOOLS:
+                continue
+
+            msg = f"Executing {tool_name}..."
+            if "graphrag" in tool_name:
+                msg = "Digging through historical store..."
+            elif "gh_" in tool_name or tool_name.startswith("get_") or tool_name == "search_issues":
+                msg = "Querying live GitHub repository..."
+                
+            yield yield_event("step", {"msg": msg})
+            await asyncio.sleep(0.01)
+            
+            fn, _ = GITHUB_TOOLS[tool_name]
+            try:
+                # Wrap sync call to avoid blocking
+                result = await asyncio.to_thread(fn, **args) if isinstance(args, dict) else await asyncio.to_thread(fn, args)
+                # Use compact JSON to save tokens, truncate to 4000 chars to prevent context flooding
+                result_str = json.dumps(result, separators=(',', ':'), default=str)[:4000]
+                tool_results.append(f"[{tool_name}] → {result_str} ... (truncated)")
+                tools_called.append(tool_name)
+            except Exception as e:
+                tool_results.append(f"[{tool_name}] → ERROR: {e}")
+                tools_called.append(f"{tool_name}(error)")
+
+    # Pass 2: Summarize
+    yield yield_event("step", {"msg": "Summarizing results..."})
+    await asyncio.sleep(0.01)
+    summary_system = (
+        "You are AutoBot, a helpful assistant. Your task is to answer the user's question "
+        "using ONLY the provided tool results. The tool results are raw JSON blocks (some may be truncated). "
+        "DO NOT output raw JSON. Extract the actual insights, statuses, or dates and write a natural language "
+        "summary. Reference issue/PR numbers with #N format. Be concise and factual. If the data to answer "
+        "the question is not in the tool results, say so."
+    )
+    summary_user = f"User question: {user_query}\n\nTool results:\n" + "\n\n".join(tool_results)
+    
+    answer = await asyncio.to_thread(chat_fn, summary_system, summary_user)
+    answer = _hyperlink_refs(answer)
+
+    yield yield_event("done", {
+        "answer": answer,
+        "tools_called": tools_called,
+        "guardrail_blocked": False,
+    })
+
+@app.post("/api/orchestrate_stream")
+async def orchestrate_stream(request: Request):
+    """Streaming endpoint for UI real-time updates."""
+    data = await request.json()
+    command = data.get("command")
+    if command != "query":
+        return JSONResponse({"error": "Only query is supported for streaming currently."}, status_code=400)
+
+    user_query = data.get("query", "")
+    mode = AUTOBOT_MODE
+    use_ollama = mode == "ollama" and ollama_available()
+    use_google_ai = mode == "google_ai" and bool(GOOGLE_API_KEY)
+    use_vertex = mode == "vertex" and bool(GCP_PROJECT_ID)
+
+    chat_fn = None
+    if use_google_ai: chat_fn = google_ai_chat
+    elif use_vertex: chat_fn = vertex_chat
+    elif use_ollama: chat_fn = ollama_chat
+
+    if not chat_fn:
+        async def err_stream():
+            yield f"data: {json.dumps({'type': 'done', 'answer': 'No LLM active', 'tools_called': []})}\n\n"
+        return StreamingResponse(err_stream(), media_type="text/event-stream")
+
+    return StreamingResponse(llm_adhoc_query_stream(chat_fn, user_query), media_type="text/event-stream")
+
+def llm_adhoc_query(chat_fn: Callable[[str, str], str], user_query: str) -> dict:
+    """
+    Three-pass adhoc query answering:
+      1. Guardrail check (is it relevant?)
+      2. LLM reads tool registry → outputs JSON tool-call plan
+      3. Execute tools deterministically → LLM summarizes results
+    """
+    # Pass 0: Soft guardrail
+    relevance = chat_fn(GUARDRAIL_PROMPT, user_query).strip().upper()
+    if "NO" in relevance and "YES" not in relevance:
+        return {
+            "answer": (
+                "I am AutoBot, an assistant dedicated to the Apache Airflow repository. "
+                "I can help with GitHub issues, PRs, CI status, code reviews, and repository queries. "
+                "I'm unable to assist with questions outside this scope."
+            ),
+            "tools_called": [],
+            "guardrail_blocked": True,
+        }
+
+    # Pass 1: LLM decides which tools to call
+    tool_descriptions = "\n".join(
+        f"- {name}: {desc}" for name, (_, desc) in GITHUB_TOOLS.items()
+    )
+    plan_system = (
+        "You are a tool-calling planner for GitHub queries about apache/airflow.\n"
+        "Available tools:\n"
+        f"{tool_descriptions}\n\n"
+        "Given the user's question, output a JSON object with a 'calls' array.\n"
+        "Each call: {\"tool\": \"<name>\", \"args\": {\"<param>\": <value>}}.\n"
+        "Max 5 calls. If the question can be answered with fewer, use fewer.\n"
+        "Output JSON only — no commentary, no markdown fences."
+    )
+    raw_plan = chat_fn(plan_system, user_query)
+
+    # Parse tool-call plan
+    tools_called: list[str] = []
+    tool_results: list[str] = []
+    try:
+        plan = extract_json_object(raw_plan)
+        calls = plan.get("calls") or []
+        for call in calls[:5]:
+            tool_name = str(call.get("tool", ""))
+            args = call.get("args") or {}
+            if tool_name not in GITHUB_TOOLS:
+                continue
+            fn, _ = GITHUB_TOOLS[tool_name]
+            try:
+                result = fn(**args) if isinstance(args, dict) else fn(args)
+                # Truncate large results for LLM context
+                result_str = json.dumps(result, indent=1, default=str)[:6000]
+                tool_results.append(f"[{tool_name}] → {result_str}")
+                tools_called.append(tool_name)
+            except Exception as e:
+                tool_results.append(f"[{tool_name}] → ERROR: {e}")
+                tools_called.append(f"{tool_name}(error)")
+    except (json.JSONDecodeError, KeyError):
+        tool_results.append(f"[raw_plan] Could not parse tool plan: {raw_plan[:500]}")
+
+    # Pass 2: LLM summarizes tool results into a user-facing answer
+    summary_system = (
+        "You are AutoBot. Summarize the GitHub API results below into a clear, "
+        "helpful answer for the user. Reference issue/PR numbers with #N format. "
+        "Be concise and factual. Do not invent data not present in the results."
+    )
+    summary_user = (
+        f"User question: {user_query}\n\n"
+        "Tool results:\n" + "\n\n".join(tool_results)
+    )
+    answer = chat_fn(summary_system, summary_user)
+    answer = _hyperlink_refs(answer)
+
+    return {
+        "answer": answer,
+        "tools_called": tools_called,
+        "guardrail_blocked": False,
+    }
+
+
+# ── Planner orchestrator integration ──────────────────────────────────────
+
+from planner_orchestrator import (
+    Issue as OrcIssue,
+    run_planner_with_refinement,
+    log_trace as orc_log_trace,
+)
+
+try:
+    from graphrag_client import get_candidate_files, neo4j_available as _neo4j_check
+except ImportError:
+    def get_candidate_files(n: int, top_k: int = 10) -> list[str]:
+        return []
+    def _neo4j_check() -> bool:
+        return False
+
+# Load tree-sitter index once at startup
+TS_INDEX_PATH = os.environ.get("TS_INDEX_PATH", "").strip()
+_ts_index: dict = {}
+if TS_INDEX_PATH and Path(TS_INDEX_PATH).is_file():
+    try:
+        _ts_index = json.loads(Path(TS_INDEX_PATH).read_text())
+        print(f"Tree-sitter index loaded: {len(_ts_index)} files from {TS_INDEX_PATH}")
+    except Exception as e:
+        print(f"Warning: could not load tree-sitter index from {TS_INDEX_PATH}: {e}")
+
+
 @app.post("/api/orchestrate")
-def orchestrate():
-    data = request.get_json(silent=True) or {}
+async def orchestrate(request: Request):
+    data = await request.json()
     command = data.get("command")
     if not command:
-        return jsonify({"error": "missing command"}), 400
+        return JSONResponse({"error": "missing command"}, status_code=400)
 
     mode = AUTOBOT_MODE
     use_ollama = mode == "ollama" and ollama_available()
@@ -602,7 +1057,11 @@ def orchestrate():
 
     if command == "ask_issue":
         n = int(data.get("issue_number") or 0)
-        return jsonify(stub_ask_issue(n))
+        return stub_ask_issue(n)
+
+    if command == "ask_pr":
+        n = int(data.get("pr_number") or 0)
+        return stub_ask_pr(n)
 
     if command == "plan_patch":
         n = data.get("issue_number")
@@ -610,46 +1069,67 @@ def orchestrate():
         try:
             n_int = int(n)
         except (TypeError, ValueError):
-            return jsonify({"error": "invalid issue_number"}), 400
+            return JSONResponse({"error": "invalid issue_number"}, status_code=400)
         if not repo:
-            return jsonify({"error": "repo_path is required (set local Airflow clone path)"}), 400
+            return JSONResponse({"error": "repo_path is required (set local Airflow clone path)"}, status_code=400)
         if not Path(repo).expanduser().is_dir():
-            return jsonify({"error": f"repo_path is not a directory: {repo}"}), 400
+            return JSONResponse({"error": f"repo_path is not a directory: {repo}"}, status_code=400)
 
         title, body = _issue_title_body(n_int)
 
+        # Determine which LLM backend to use
+        chat_fn = None
+        backend_label = "stub"
         if use_google_ai:
-            try:
-                return jsonify(
-                    llm_plan(
-                        google_ai_chat,
-                        n_int,
-                        repo,
-                        title,
-                        body,
-                        f"google_ai:{GEMINI_MODEL}",
-                    )
-                )
-            except Exception as e:
-                return jsonify({"error": f"google_ai planner failed: {e}"}), 502
+            chat_fn = google_ai_chat
+            backend_label = f"google_ai:{GEMINI_MODEL}"
+        elif use_vertex:
+            chat_fn = vertex_chat
+            backend_label = f"vertex:{VERTEX_MODEL}"
+        elif use_ollama:
+            chat_fn = ollama_chat
+            backend_label = f"ollama:{OLLAMA_MODEL}"
 
-        if use_vertex:
-            try:
-                return jsonify(
-                    llm_plan(vertex_chat, n_int, repo, title, body, f"vertex:{VERTEX_MODEL}")
-                )
-            except Exception as e:
-                return jsonify({"error": f"vertex planner failed: {e}"}), 502
+        if chat_fn is None:
+            return stub_plan(n_int, repo)
 
-        if use_ollama:
-            try:
-                return jsonify(
-                    llm_plan(ollama_chat, n_int, repo, title, body, f"ollama:{OLLAMA_MODEL}")
-                )
-            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as e:
-                return jsonify({"error": f"ollama planner failed: {e}"}), 502
+        # Run planner through the orchestrator refinement loop
+        try:
+            issue_obj = OrcIssue(number=n_int, title=title, body=body)
+            repo_ctx = build_repo_context(repo)
+            graphrag_candidates = get_candidate_files(n_int) if _neo4j_check() else []
 
-        return jsonify(stub_plan(n_int, repo))
+            plan, trace = run_planner_with_refinement(
+                chat_fn=chat_fn,
+                issue=issue_obj,
+                repo_path=repo,
+                repo_context=repo_ctx,
+                ts_index=_ts_index,
+                graphrag_candidates=graphrag_candidates,
+                backend=backend_label,
+            )
+            orc_log_trace(trace)
+
+            return {
+                "issue_number": n_int,
+                "repo_path": repo,
+                "plan": {
+                    "summary": plan.summary,
+                    "files": plan.files,
+                    "steps": plan.steps,
+                },
+                "code_spans": plan.code_spans,
+                "note": f"planner via {backend_label} (orchestrator: {trace.iterations} refinement passes, confidence={trace.final_confidence})",
+                "orchestrator_trace": {
+                    "iterations": trace.iterations,
+                    "final_confidence": trace.final_confidence,
+                    "triggers_detected": trace.triggers_detected,
+                    "research_steps_used": trace.research_steps_used,
+                },
+            }
+        except Exception as e:
+            return JSONResponse({"error": f"planner orchestrator failed: {e}"}, status_code=502)
+
 
     if command == "accept_plan":
         plan = data.get("plan")
@@ -664,116 +1144,134 @@ def orchestrate():
             pass
         if use_google_ai:
             try:
-                return jsonify(
-                    llm_patch_and_critic(
-                        google_ai_chat,
-                        issue_title,
-                        issue_body,
-                        plan,
-                        code_spans,
-                        f"google_ai:{GEMINI_MODEL}",
-                    )
-                )
+                return llm_patch_and_critic(google_ai_chat, issue_title, issue_body, plan, code_spans, f"google_ai:{GEMINI_MODEL}")
             except Exception as e:
-                return jsonify({"error": f"google_ai patch/critic failed: {e}"}), 502
+                return JSONResponse({"error": f"google_ai patch/critic failed: {e}"}, status_code=502)
 
         if use_vertex:
             try:
-                return jsonify(
-                    llm_patch_and_critic(
-                        vertex_chat,
-                        issue_title,
-                        issue_body,
-                        plan,
-                        code_spans,
-                        f"vertex:{VERTEX_MODEL}",
-                    )
-                )
+                return llm_patch_and_critic(vertex_chat, issue_title, issue_body, plan, code_spans, f"vertex:{VERTEX_MODEL}")
             except Exception as e:
-                return jsonify({"error": f"vertex patch/critic failed: {e}"}), 502
+                return JSONResponse({"error": f"vertex patch/critic failed: {e}"}, status_code=502)
 
         if use_ollama:
             try:
-                return jsonify(
-                    llm_patch_and_critic(
-                        ollama_chat,
-                        issue_title,
-                        issue_body,
-                        plan,
-                        code_spans,
-                        f"ollama:{OLLAMA_MODEL}",
-                    )
-                )
+                return llm_patch_and_critic(ollama_chat, issue_title, issue_body, plan, code_spans, f"ollama:{OLLAMA_MODEL}")
             except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as e:
-                return jsonify({"error": f"ollama patch/critic failed: {e}"}), 502
+                return JSONResponse({"error": f"ollama patch/critic failed: {e}"}, status_code=502)
 
-        return (
-            jsonify(
-                {
-                    "error": (
-                        "No active LLM mode for accept_plan. Set AUTOBOT_MODE to "
-                        "google_ai, vertex, or ollama and restart app.py."
-                    )
-                }
-            ),
-            400,
+        return JSONResponse(
+            {"error": "No active LLM mode for accept_plan. Set AUTOBOT_MODE to google_ai, vertex, or ollama and restart."},
+            status_code=400,
         )
 
     if command == "open_pr":
         diff = str(data.get("diff") or "")
-        return jsonify(
-            {
-                "status": "ok",
-                "title": "[local] AutoBot draft PR",
-                "body": f"Local test PR.\n\n```diff\n{diff[:2000]}\n```",
-                "html_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/compare/local-test",
-                "note": "No GitHub API call",
-            }
-        )
+        return {
+            "status": "ok",
+            "title": "[local] AutoBot draft PR",
+            "body": f"Local test PR.\n\n```diff\n{diff[:2000]}\n```",
+            "html_url": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/compare/local-test",
+            "note": "No GitHub API call",
+        }
 
-    return jsonify({"error": f"unknown command: {command}"}), 400
+    if command == "query":
+        user_query = str(data.get("query") or "").strip()
+        if not user_query:
+            return JSONResponse({"error": "'query' field is required"}, status_code=400)
+        if not GITHUB_TOKEN:
+            return {"answer": "GITHUB_TOKEN is not set. Please add it to .env and restart.", "tools_called": []}
+        chat_fn = None
+        backend = "stub"
+        if use_google_ai:
+            chat_fn = google_ai_chat
+            backend = f"google_ai:{GEMINI_MODEL}"
+        elif use_vertex:
+            chat_fn = vertex_chat
+            backend = f"vertex:{VERTEX_MODEL}"
+        elif use_ollama:
+            chat_fn = ollama_chat
+            backend = f"ollama:{OLLAMA_MODEL}"
+        if chat_fn is None:
+            return {"answer": "No LLM active — set AUTOBOT_MODE in .env", "tools_called": []}
+        try:
+            result = llm_adhoc_query(chat_fn, user_query)
+            result["backend"] = backend
+            return result
+        except Exception as e:
+            return JSONResponse({"error": f"query failed: {e}"}, status_code=502)
+
+    if command == "detect_intent":
+        text = data.get("text", "")
+        chat_fn = None
+        if use_google_ai: chat_fn = google_ai_chat
+        elif use_vertex: chat_fn = vertex_chat
+        elif use_ollama: chat_fn = ollama_chat
+        
+        if not chat_fn:
+            return JSONResponse({"error": "No LLM active for intent detection"}, status_code=502)
+        
+        prompt = (
+            "You are an intent router for a GitHub assistant. "
+            "Given the user's message, output ONLY a JSON object with 'intent' and 'issue_number' (or 'pr_number').\n"
+            "Intents:\n"
+            "- 'plan_patch': user specifically asks to fix, patch, or write code for an issue.\n"
+            "- 'ask_issue': user just provides an issue number or asks to simply view/read it.\n"
+            "- 'ask_pr': user just provides a PR number or asks to simply view/read a PR.\n"
+            "- 'query': user asks a general question (e.g., 'who closed PR', 'status of issue', etc).\n"
+            "If an issue number is found, extract it as an integer in 'issue_number'. "
+            "If a PR number is found for ask_pr, extract it as an integer in 'pr_number'.\n"
+            "Output JSON only.\n"
+            f"Message: {text}"
+        )
+        try:
+            raw = chat_fn("You are a helpful JSON router.", prompt)
+            return extract_json_object(raw)
+        except Exception as e:
+            return JSONResponse({"error": f"Intent detection failed: {e}"}, status_code=502)
+
+    return JSONResponse({"error": f"unknown command: {command}"}, status_code=400)
+
 
 
 @app.get("/health")
-def health():
+async def health():
     ollama_ok = ollama_available()
-    return jsonify(
-        {
-            "status": "ok",
-            "service": "local_autobot_orchestrator",
-            "mode": AUTOBOT_MODE,
-            "gcp_project": GCP_PROJECT_ID or None,
-            "gcp_location": GCP_LOCATION,
-            "vertex_model": VERTEX_MODEL,
-            "vertex_ready": bool(GCP_PROJECT_ID),
-            "vertex_llm_active": AUTOBOT_MODE == "vertex" and bool(GCP_PROJECT_ID),
-            "gemini_model": GEMINI_MODEL,
-            "google_api_key_set": bool(GOOGLE_API_KEY),
-            "google_ai_llm_active": AUTOBOT_MODE == "google_ai" and bool(GOOGLE_API_KEY),
-            "github_repo": f"{GITHUB_OWNER}/{GITHUB_REPO}",
-            "github_token_set": bool(GITHUB_TOKEN),
-            "ollama_host": OLLAMA_HOST,
-            "ollama_model": OLLAMA_MODEL,
-            "ollama_reachable": ollama_ok,
-            "ollama_llm_active": AUTOBOT_MODE == "ollama" and ollama_ok,
-        }
-    )
+    return {
+        "status": "ok",
+        "service": "local_autobot_orchestrator",
+        "mode": AUTOBOT_MODE,
+        "gcp_project": GCP_PROJECT_ID or None,
+        "gcp_location": GCP_LOCATION,
+        "vertex_model": VERTEX_MODEL,
+        "vertex_ready": bool(GCP_PROJECT_ID),
+        "vertex_llm_active": AUTOBOT_MODE == "vertex" and bool(GCP_PROJECT_ID),
+        "gemini_model": GEMINI_MODEL,
+        "google_api_key_set": bool(GOOGLE_API_KEY),
+        "google_ai_llm_active": AUTOBOT_MODE == "google_ai" and bool(GOOGLE_API_KEY),
+        "github_repo": f"{GITHUB_OWNER}/{GITHUB_REPO}",
+        "github_token_set": bool(GITHUB_TOKEN),
+        "ollama_host": OLLAMA_HOST,
+        "ollama_model": OLLAMA_MODEL,
+        "ollama_reachable": ollama_ok,
+        "ollama_llm_active": AUTOBOT_MODE == "ollama" and ollama_ok,
+    }
 
 
 @app.get("/api/orchestrate")
-def orchestrate_get():
-    return jsonify(
-        {
-            "message": "POST JSON with command ask_issue | plan_patch | accept_plan | open_pr",
-            "autobot_mode": AUTOBOT_MODE,
-            "google_ai": f"model={GEMINI_MODEL} (GOOGLE_API_KEY in .env)",
-            "vertex": f"{VERTEX_MODEL} project={GCP_PROJECT_ID or '?'} location={GCP_LOCATION}",
-            "ollama": f"{OLLAMA_HOST} model={OLLAMA_MODEL}",
-        }
-    )
+async def orchestrate_get():
+    return {
+        "message": "POST JSON with command: ask_issue | plan_patch | accept_plan | open_pr | query",
+        "docs": "http://127.0.0.1:5000/docs",
+        "autobot_mode": AUTOBOT_MODE,
+        "google_ai": f"model={GEMINI_MODEL} (GOOGLE_API_KEY in .env)",
+        "vertex": f"{VERTEX_MODEL} project={GCP_PROJECT_ID or '?'} location={GCP_LOCATION}",
+        "ollama": f"{OLLAMA_HOST} model={OLLAMA_MODEL}",
+    }
 
 
 def main() -> None:
+    import uvicorn
     port = int(os.environ.get("PORT", "5000"))
     print(f"AUTOBOT_MODE={AUTOBOT_MODE} GCP_PROJECT_ID={GCP_PROJECT_ID or '(unset)'}")
     print(
@@ -782,8 +1280,9 @@ def main() -> None:
         f"OLLAMA reachable={ollama_available()}"
     )
     print(f"GitHub repo={GITHUB_OWNER}/{GITHUB_REPO} token={'set' if GITHUB_TOKEN else 'unset'}")
-    print(f"Listening on http://127.0.0.1:{port}  POST /api/orchestrate")
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    print(f"Listening on http://127.0.0.1:{port}")
+    print(f"API docs:   http://127.0.0.1:{port}/docs")
+    uvicorn.run("app:app", host="127.0.0.1", port=port, reload=True)
 
 
 if __name__ == "__main__":

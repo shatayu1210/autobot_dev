@@ -1,5 +1,6 @@
-flask>=3.0.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
 python-dotenv>=1.0.0
-langchain-core>=1.2.13
-langchain-google-genai>=2.0.0
-google-cloud-aiplatform>=1.138.0
+requests>=2.31.0
+langchain-google-genai>=1.0.0
+neo4j>=5.0.0
