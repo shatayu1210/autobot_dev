@@ -1,0 +1,62 @@
+{
+  "timestamp": "2026-04-19T03:22:43.733984",
+  "filters_applied": [
+    "bot_removal"
+  ],
+  "raw_issues": 12357,
+  "raw_prs": 41333,
+  "bot_issues_removed": 0,
+  "bot_prs_removed": 2368,
+  "bot_pr_breakdown": {
+    "github-actions[bot]": 1217,
+    "dependabot[bot]": 1151
+  },
+  "clean_issues": 12357,
+  "clean_prs": 38965,
+  "issues_with_prs": 5719,
+  "issues_without_prs": 6638,
+  "prs_linked": 7438,
+  "prs_standalone": 31527,
+  "top_labels": {
+    "kind:bug": 7696,
+    "area:core": 4087,
+    "kind:feature": 2695,
+    "good first issue": 2202,
+    "needs-triage": 1966,
+    "area:providers": 1794,
+    "area:UI": 1392,
+    "pending-response": 882,
+    "kind:meta": 855,
+    "area:API": 590,
+    "kind:documentation": 516,
+    "provider:google": 471,
+    "stale": 468,
+    "invalid": 467,
+    "area:helm-chart": 462,
+    "provider:cncf-kubernetes": 432,
+    "provider:amazon": 411,
+    "area:Scheduler": 350,
+    "affected_version:2.0": 319,
+    "Stale Bug Report": 313,
+    "area:webserver": 291,
+    "priority:medium": 277,
+    "affected_version:3.0": 276,
+    "area:logging": 265,
+    "priority:high": 261,
+    "duplicate": 225,
+    "testing status": 204,
+    "area:auth": 181,
+    "area:CLI": 180,
+    "kind:task": 175
+  },
+  "prs_merged": 32776,
+  "prs_closed_only": 6189,
+  "ci_distribution": {
+    "none": 27372,
+    "mixed": 9838,
+    "failure": 1178,
+    "success": 577
+  },
+  "prs_with_reviews": 35202,
+  "median_files_per_pr": 2
+}

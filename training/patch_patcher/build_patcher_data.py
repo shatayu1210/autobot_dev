@@ -1,16 +1,25 @@
 """
-Build production-grade patcher dataset with Tree-sitter + GraphRAG enrichment.
+Build patcher FT dataset aligned with inference orchestrator context assembly.
+
+Proxies Planner scope from issue/PR metadata; builds file_contexts (primary /
+supporting / tests) similar to patcher-orchestrator; supervised rows set
+allowed_edit_files to gold-touched paths.
 
 Outputs:
   - patcher_train.jsonl
   - patcher_eval.jsonl
   - patcher_test.jsonl
   - dataset_report.json
+
+Optional: set MAX_TRAIN_EXAMPLES to cap train rows after the stratified split (faster SFT;
+eval/test unchanged). See training/patch_patcher/patcher_handover.md for sample-size guidance.
+
+Run directly: edit INPUT_PATH / REPO_ROOT / OUTPUT_DIR below, then
+  python training/patch_patcher/build_patcher_data.py
 """
 
 from __future__ import annotations
 
-import argparse
 import ast
 import json
 import logging
@@ -33,6 +42,62 @@ except Exception:
 
 
 LOG = logging.getLogger("build_patcher_data")
+
+# -----------------------------------------------------------------------------
+# Direct run: edit paths and knobs (no argparse).
+# -----------------------------------------------------------------------------
+_THIS_DIR = Path(__file__).resolve().parent
+# build_patcher_data.py → training/patch_patcher/: parents[1] is autobot_dev repo root
+_WORKSPACE_ROOT = _THIS_DIR.parents[1]
+
+INPUT_PATH = _WORKSPACE_ROOT / "etl" / "training_data" / "prs_clean.jsonl"
+REPO_ROOT = _WORKSPACE_ROOT
+OUTPUT_DIR = _THIS_DIR / "outputs"
+
+RNG_SEED = 42
+MAX_FILES_TOUCHED = 3
+SINGLE_FILE_ONLY = False
+MAX_ADDITIONS = 350
+MAX_PATCH_TOKENS = 1200
+MAX_SEQ_TOKENS = 12288
+SPLIT_TRAIN = 0.8
+SPLIT_EVAL = 0.1
+SPLIT_TEST = 0.1
+# After the 80/10/10 split, optionally cap train rows (None = full train). Useful for
+# shorter LoRA runs; eval/test are unchanged. Reproducible shuffle uses cfg.seed + 4133.
+MAX_TRAIN_EXAMPLES: int | None = None
+ENABLE_TREESITTER_LEGACY_SPANS = True
+ENABLE_GRAPHRAG = True
+GRAPHRAG_TOP_K = 6
+GRAPHRAG_QUERY_VERSION = "v1_file_neighbors"
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "autobot_password"
+ISSUE_TITLE_COL = "issue_title"
+ISSUE_BODY_COL = "issue_body"
+ISSUE_LABELS_COL = "issue_labels"
+ISSUE_COMMENTS_COL = "comments_summary"
+_ALLOWED_EXT_STR = ".py,.ts,.tsx,.js,.jsx,.sql,.yaml,.yml,.json,.md,.rst,.toml,.ini,.cfg,.sh,.dockerfile"
+ALLOWED_EXTENSIONS: set[str] = {x.strip().lower() for x in _ALLOWED_EXT_STR.split(",") if x.strip()}
+
+PRIMARY_FULL_MAX_LINES = 380
+PRIMARY_WINDOW_PAD = 20
+PRIMARY_MAX_LINES_WINDOW_MODE = 280
+MODULE_SEARCH_PREFIXES = ("", "src", "lib", "packages")
+
+SUPPORTING_TOP_K_WINDOWS = 12
+SUPPORTING_MAX_LINES_PER_WINDOW = 95
+GRAPH_SUPPORTING_SNIPPET_LINES = 70
+SAME_FILE_SUPPORTING_SYMBOLS = 4
+IMPORT_RESOLVE_MAX = 12
+CALLERS_RG_MAX_FILES = 4
+
+TEST_CONTEXT_MAX_WINDOWS = 8
+TEST_MAX_LINES_PER_WINDOW = 200
+
+
+def _default_allowed_extensions() -> set[str]:
+    return set(ALLOWED_EXTENSIONS)
 
 
 @dataclass
@@ -61,89 +126,48 @@ class Config:
     issue_labels_col: str
     issue_comments_col: str
     allowed_extensions: set[str]
+    tracked_py_paths: frozenset[str]
+    max_train_examples: int | None = None
+
+    primary_full_max_lines: int = PRIMARY_FULL_MAX_LINES
+    primary_window_pad: int = PRIMARY_WINDOW_PAD
+    primary_max_lines_window_mode: int = PRIMARY_MAX_LINES_WINDOW_MODE
+    supporting_top_k_windows: int = SUPPORTING_TOP_K_WINDOWS
+    supporting_max_lines_per_window: int = SUPPORTING_MAX_LINES_PER_WINDOW
+    enable_callers_rg: bool = True
 
 
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser(
-        description="Build strict patcher dataset JSONL splits with Tree-sitter and GraphRAG context."
-    )
-    script_dir = Path(__file__).resolve().parent
-    parser.add_argument(
-        "--input-path",
-        type=Path,
-        required=True,
-        help="PR dataset path (.csv or .jsonl).",
-    )
-    parser.add_argument(
-        "--repo-path",
-        type=Path,
-        required=True,
-        help="Local git repo path for base/head blob extraction by SHA.",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        default=script_dir / "outputs",
-        help="Output directory for split JSONLs and dataset_report.json.",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-files-touched", type=int, default=3)
-    parser.add_argument("--single-file-only", action="store_true")
-    parser.add_argument("--max-additions", type=int, default=350)
-    parser.add_argument("--max-patch-tokens", type=int, default=1200)
-    parser.add_argument("--max-seq-tokens", type=int, default=4096)
-    parser.add_argument("--split-train", type=float, default=0.8)
-    parser.add_argument("--split-eval", type=float, default=0.1)
-    parser.add_argument("--split-test", type=float, default=0.1)
-    parser.add_argument("--disable-treesitter", action="store_true")
-    parser.add_argument("--disable-graphrag", action="store_true")
-    parser.add_argument("--graphrag-top-k", type=int, default=6)
-    parser.add_argument("--graphrag-query-version", type=str, default="v1_file_neighbors")
-    parser.add_argument("--neo4j-uri", type=str, default="bolt://localhost:7687")
-    parser.add_argument("--neo4j-user", type=str, default="neo4j")
-    parser.add_argument("--neo4j-password", type=str, default="autobot_password")
-
-    # Optional issue context columns.
-    parser.add_argument("--issue-title-col", type=str, default="issue_title")
-    parser.add_argument("--issue-body-col", type=str, default="issue_body")
-    parser.add_argument("--issue-labels-col", type=str, default="issue_labels")
-    parser.add_argument("--issue-comments-col", type=str, default="comments_summary")
-    parser.add_argument(
-        "--allowed-extensions",
-        type=str,
-        default=".py,.ts,.tsx,.js,.jsx,.sql,.yaml,.yml,.json,.md,.rst,.toml,.ini,.cfg,.sh,.dockerfile",
-        help="Comma-separated list of file extensions to keep (lowercase, include dot).",
-    )
-
-    args = parser.parse_args()
-    if round(args.split_train + args.split_eval + args.split_test, 6) != 1.0:
-        raise ValueError("Split ratios must sum to 1.0")
-
+def build_default_config(tracked_py: frozenset[str]) -> Config:
+    splits = SPLIT_TRAIN + SPLIT_EVAL + SPLIT_TEST
+    if round(splits, 6) != 1.0:
+        raise ValueError("SPLIT_TRAIN + SPLIT_EVAL + SPLIT_TEST must sum to 1.0")
     return Config(
-        input_path=args.input_path,
-        repo_path=args.repo_path,
-        out_dir=args.out_dir,
-        seed=args.seed,
-        max_files_touched=args.max_files_touched,
-        single_file_only=args.single_file_only,
-        max_additions=args.max_additions,
-        max_patch_tokens=args.max_patch_tokens,
-        max_seq_tokens=args.max_seq_tokens,
-        split_train=args.split_train,
-        split_eval=args.split_eval,
-        split_test=args.split_test,
-        enable_treesitter=not args.disable_treesitter,
-        enable_graphrag=not args.disable_graphrag,
-        graphrag_top_k=args.graphrag_top_k,
-        graphrag_query_version=args.graphrag_query_version,
-        neo4j_uri=args.neo4j_uri,
-        neo4j_user=args.neo4j_user,
-        neo4j_password=args.neo4j_password,
-        issue_title_col=args.issue_title_col,
-        issue_body_col=args.issue_body_col,
-        issue_labels_col=args.issue_labels_col,
-        issue_comments_col=args.issue_comments_col,
-        allowed_extensions={x.strip().lower() for x in args.allowed_extensions.split(",") if x.strip()},
+        input_path=INPUT_PATH,
+        repo_path=REPO_ROOT,
+        out_dir=OUTPUT_DIR,
+        seed=RNG_SEED,
+        max_files_touched=MAX_FILES_TOUCHED,
+        single_file_only=SINGLE_FILE_ONLY,
+        max_additions=MAX_ADDITIONS,
+        max_patch_tokens=MAX_PATCH_TOKENS,
+        max_seq_tokens=MAX_SEQ_TOKENS,
+        split_train=SPLIT_TRAIN,
+        split_eval=SPLIT_EVAL,
+        split_test=SPLIT_TEST,
+        enable_treesitter=ENABLE_TREESITTER_LEGACY_SPANS,
+        enable_graphrag=ENABLE_GRAPHRAG,
+        graphrag_top_k=GRAPHRAG_TOP_K,
+        graphrag_query_version=GRAPHRAG_QUERY_VERSION,
+        neo4j_uri=NEO4J_URI,
+        neo4j_user=NEO4J_USER,
+        neo4j_password=NEO4J_PASSWORD,
+        issue_title_col=ISSUE_TITLE_COL,
+        issue_body_col=ISSUE_BODY_COL,
+        issue_labels_col=ISSUE_LABELS_COL,
+        issue_comments_col=ISSUE_COMMENTS_COL,
+        allowed_extensions=_default_allowed_extensions(),
+        tracked_py_paths=tracked_py,
+        max_train_examples=MAX_TRAIN_EXAMPLES,
     )
 
 
@@ -277,6 +301,455 @@ def normalize_file_path(p: str) -> str:
     while s.startswith("./"):
         s = s[2:]
     return s
+
+
+def git_list_tracked_paths(repo_path: Path, suffix: str = ".py") -> frozenset[str]:
+    cmd = ["git", "-C", str(repo_path), "ls-files", "-z"]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        return frozenset()
+    out = []
+    for rel in proc.stdout.split(b"\0"):
+        if not rel:
+            continue
+        decoded = rel.decode("utf-8", errors="replace").replace("\\", "/")
+        if decoded.lower().endswith(suffix.lower()):
+            out.append(decoded.strip())
+    return frozenset(out)
+
+
+def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    intervals = [(a, b) for a, b in intervals if a <= b]
+    if not intervals:
+        return []
+    intervals.sort(key=lambda x: (x[0], x[1]))
+    merged: list[tuple[int, int]] = [intervals[0]]
+    for lo, hi in intervals[1:]:
+        ml, mh = merged[-1]
+        if lo <= mh + 1:
+            merged[-1] = (ml, max(mh, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def clip_windows_to_budget(
+    intervals: list[tuple[int, int]], max_lines: int
+) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    total = sum(h - lo + 1 for lo, h in intervals)
+    if total <= max_lines:
+        return intervals
+    out: list[tuple[int, int]] = []
+    budget = max_lines
+    for lo, hi in intervals:
+        span = hi - lo + 1
+        if span <= budget:
+            out.append((lo, hi))
+            budget -= span
+            if budget <= 0:
+                break
+            continue
+        out.append((lo, lo + budget - 1))
+        break
+    return merge_intervals(out)
+
+
+def is_probable_test_path(path: str) -> bool:
+    p = path.lower().replace("\\", "/")
+    if "/tests/" in p or "/test/" in p or "/testing/" in p:
+        return True
+    bn = Path(p).name
+    if bn.startswith("test_") or bn.endswith("_test.py") or bn == "conftest.py":
+        return True
+    if bn.startswith("test") and bn.endswith(".py"):
+        return True
+    return False
+
+
+def numbered_text(lines: list[str], lo: int, hi: int) -> str:
+    parts = []
+    for i, ln in enumerate(lines[lo - 1 : hi], start=lo):
+        parts.append(f"{i:6d}|{ln}")
+    return "\n".join(parts)
+
+
+def build_primary_windows(
+    repo_path: Path,
+    base_sha: str,
+    fname: str,
+    patch_text: str,
+    cfg: Config,
+) -> list[dict[str, Any]]:
+    base_text = get_blob_at_sha(repo_path, base_sha, fname)
+    lines = base_text.splitlines()
+    n = len(lines)
+    headers = parse_hunk_headers(patch_text)
+    if not headers and n > 0:
+        headers = [{"old_start": 1, "old_count": min(80, n), "new_start": 1, "new_count": min(80, n)}]
+
+    intervals: list[tuple[int, int]] = []
+    pad = cfg.primary_window_pad
+    for h in headers:
+        lo = max(1, int(h["old_start"]) - pad)
+        hi = min(n, int(h["old_start"]) + max(int(h["old_count"]), 1) + pad - 1)
+        if n > 0:
+            intervals.append((lo, hi))
+    intervals = merge_intervals(intervals)
+
+    if n > 0 and n <= cfg.primary_full_max_lines:
+        presentation = "full"
+        slices = [(1, n)]
+    elif intervals:
+        presentation = "window"
+        slices = clip_windows_to_budget(intervals, cfg.primary_max_lines_window_mode)
+    else:
+        presentation = "window"
+        slices = [(1, min(n, cfg.primary_max_lines_window_mode) if n else 1)] if n else [(1, 1)]
+
+    out: list[dict[str, Any]] = []
+    for lo, hi in slices:
+        if not lines:
+            out.append(
+                {
+                    "path": fname,
+                    "role": "primary",
+                    "source": "changed_in_pr",
+                    "presentation": presentation,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "text": "",
+                }
+            )
+            continue
+        lo = max(1, lo)
+        hi = min(len(lines), hi)
+        out.append(
+            {
+                "path": fname,
+                "role": "primary",
+                "source": "changed_in_pr",
+                "presentation": presentation,
+                "line_start": lo,
+                "line_end": hi,
+                "text": numbered_text(lines, lo, hi),
+            }
+        )
+    return out
+
+
+def _resolve_module_path_candidates(repo_path: Path, fragments: tuple[str, ...]) -> list[str]:
+    if not fragments:
+        return []
+    name = fragments[-1]
+    parent_chunks = fragments[:-1]
+    found = []
+    for pref in MODULE_SEARCH_PREFIXES:
+        stem = repo_path / pref / Path(*parent_chunks) if parent_chunks else repo_path / pref
+        p1 = stem / (name + ".py")
+        p2 = stem / name / "__init__.py"
+        for pth in (p1, p2):
+            try:
+                if pth.is_file():
+                    found.append(normalize_file_path(str(pth.relative_to(repo_path))))
+            except ValueError:
+                continue
+    return sorted(set(found))[: IMPORT_RESOLVE_MAX * 2]
+
+
+def import_targets_absolute(repo_path: Path, source: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                tops = tuple(al.name.split("."))
+                for p in _resolve_module_path_candidates(repo_path, tops):
+                    out.append((p, "import"))
+        elif isinstance(node, ast.ImportFrom):
+            if getattr(node, "level", 0):
+                continue
+            if not node.module:
+                continue
+            tops = tuple(node.module.split("."))
+            hits = _resolve_module_path_candidates(repo_path, tops)
+            for nm in node.names:
+                if nm.name == "*":
+                    out.extend([(h, "import_from_star") for h in hits][:IMPORT_RESOLVE_MAX])
+                    continue
+                suffix = tops + (nm.name,)
+                for p in _resolve_module_path_candidates(repo_path, suffix):
+                    out.append((p, "import_from"))
+    return list(dict.fromkeys(out))[:IMPORT_RESOLVE_MAX]
+
+
+def same_file_symbols_for_supporting(base_text: str, touched_ln: set[int], max_symbols: int) -> list[tuple[int, int, str, str]]:
+    symbols: list[tuple[int, int, str, str]] = []
+    try:
+        tree = ast.parse(base_text)
+    except Exception:
+        return symbols
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            lo = getattr(node, "lineno", None) or 1
+            hi = getattr(node, "end_lineno", None) or lo
+            if any(lo <= ln <= hi for ln in touched_ln):
+                continue
+            st = "class" if isinstance(node, ast.ClassDef) else "function"
+            symbols.append((lo, hi, node.name, st))
+    symbols.sort(key=lambda z: abs(z[0] - (min(touched_ln) if touched_ln else z[0])))
+    return symbols[:max_symbols]
+
+
+def rg_python_files_matching(repo_path: Path, substring: str, exclude: set[str], limit: int) -> list[str]:
+    """Best-effort ripgrep; empty if rg missing or failures."""
+    if not substring or not substring.strip():
+        return []
+    proc = subprocess.run(
+        ["rg", "-l", "-F", "-g", "*.py", substring, "."],
+        cwd=str(repo_path),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode not in (0, 1):
+        return []
+    paths = []
+    for line in (proc.stdout or "").splitlines():
+        p = normalize_file_path(line.strip())
+        if p and p not in exclude:
+            paths.append(p)
+            if len(paths) >= limit * 10:
+                break
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+        if len(uniq) >= limit:
+            break
+    return uniq
+
+
+def snippet_head_numbered(blob: str, max_lines: int) -> tuple[str, int, int]:
+    lines = blob.splitlines()
+    if not lines:
+        return "", 1, 1
+    hi = min(len(lines), max_lines)
+    return numbered_text(lines, 1, hi), 1, hi
+
+
+def build_supporting_windows(
+    repo_path: Path,
+    base_sha: str,
+    primary_paths: set[str],
+    selected_py_sources: dict[str, str],
+    touched_line_by_file: dict[str, set[int]],
+    cfg: Config,
+    graph_neighbor_paths: list[str],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, int, int]] = set()
+
+    def append_entry(path: str, source: str, text: str, lo: int, hi: int) -> None:
+        if path in primary_paths:
+            return
+        key = (path, lo, hi)
+        if key in seen_keys:
+            return
+        if len(entries) >= cfg.supporting_top_k_windows:
+            return
+        seen_keys.add(key)
+        entries.append(
+            {
+                "path": path,
+                "role": "supporting",
+                "source": source,
+                "line_start": lo,
+                "line_end": hi,
+                "text": text,
+            }
+        )
+
+    for pth, py_src in selected_py_sources.items():
+        touched_ln = touched_line_by_file.get(pth, set())
+        for rel, kind in import_targets_absolute(repo_path, py_src):
+            if rel in primary_paths:
+                continue
+            if rel not in cfg.tracked_py_paths:
+                continue
+            try:
+                blob = get_blob_at_sha(repo_path, base_sha, rel)
+                body, lo, hi = snippet_head_numbered(blob, GRAPH_SUPPORTING_SNIPPET_LINES)
+                append_entry(rel, f"resolved_import::{kind}", body, lo, hi)
+            except Exception:
+                continue
+            if len(entries) >= cfg.supporting_top_k_windows:
+                return entries
+
+        try:
+            base_full = get_blob_at_sha(repo_path, base_sha, pth)
+        except Exception:
+            continue
+        for slo, shi, sym, stype in same_file_symbols_for_supporting(base_full, touched_ln, SAME_FILE_SUPPORTING_SYMBOLS):
+            hi = min(len(base_full.splitlines()), shi + 18)
+            lo = max(1, slo - 6)
+            lines = base_full.splitlines()
+            body = numbered_text(lines, lo, hi)
+            append_entry(
+                pth,
+                f"same_file_ast_symbol::{stype}:{sym}",
+                body,
+                lo,
+                hi,
+            )
+            if len(entries) >= cfg.supporting_top_k_windows:
+                return entries
+
+    if graph_neighbor_paths and cfg.enable_graphrag:
+        for rel in graph_neighbor_paths:
+            rel_n = normalize_file_path(rel)
+            if not rel_n or rel_n in primary_paths:
+                continue
+            if rel_n not in cfg.tracked_py_paths and not file_allowed_by_extension(
+                rel_n, cfg.allowed_extensions
+            ):
+                continue
+            try:
+                blob = get_blob_at_sha(repo_path, base_sha, rel_n)
+                body, lo, hi = snippet_head_numbered(blob, GRAPH_SUPPORTING_SNIPPET_LINES)
+                append_entry(rel_n, "graphrag_co_touch_neighbor", body, lo, hi)
+            except Exception:
+                continue
+            if len(entries) >= cfg.supporting_top_k_windows:
+                return entries
+
+    if cfg.enable_callers_rg:
+        for pth in sorted(primary_paths):
+            if not pth.endswith(".py"):
+                continue
+            touched_ln = touched_line_by_file.get(pth)
+            syms = []
+            try:
+                base_full = get_blob_at_sha(repo_path, base_sha, pth)
+                for slo, shi, sym, _st in parse_python_symbols_for_names(base_full, touched_ln or set()):
+                    syms.append(sym)
+            except Exception:
+                continue
+            for sym in syms[:3]:
+                excludes_primary = frozenset(primary_paths)
+                for hit in rg_python_files_matching(repo_path, sym + "(", excludes_primary, CALLERS_RG_MAX_FILES):
+                    if hit in primary_paths:
+                        continue
+                    if hit not in cfg.tracked_py_paths:
+                        continue
+                    try:
+                        blob = get_blob_at_sha(repo_path, base_sha, hit)
+                        body, lo, hi = snippet_head_numbered(blob, GRAPH_SUPPORTING_SNIPPET_LINES)
+                        append_entry(hit, f"rg_callee_occurrence::{sym}", body, lo, hi)
+                    except Exception:
+                        continue
+                    if len(entries) >= cfg.supporting_top_k_windows:
+                        return entries
+
+    return entries[: cfg.supporting_top_k_windows]
+
+
+def parse_python_symbols_for_names(base_text: str, touched_ln: set[int]) -> list[tuple[int, int, str, str]]:
+    out: list[tuple[int, int, str, str]] = []
+    try:
+        tree = ast.parse(base_text)
+    except Exception:
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            lo = getattr(node, "lineno", None) or 1
+            hi = getattr(node, "end_lineno", None) or lo
+            if touched_ln and not any(lo <= ln <= hi for ln in touched_ln):
+                continue
+            st = "class" if isinstance(node, ast.ClassDef) else "function"
+            out.append((lo, hi, node.name, st))
+    out.sort(key=lambda z: z[0])
+    return out
+
+
+def nearest_test_snapshots(
+    repo_path: Path,
+    base_sha: str,
+    primary_paths: list[str],
+    tracked_tests: frozenset[str],
+    changed_tests: list[str],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    used: set[str] = set()
+    prim_non_test = [p for p in primary_paths if not is_probable_test_path(p)]
+    stems = sorted(
+        {
+            Path(p).stem.replace("_", "")
+            for p in prim_non_test
+            if Path(p).stem and len(Path(p).stem.replace("_", "")) >= 3
+        }
+    )
+    dirs = sorted({str(Path(p).parent).replace("\\", "/") for p in prim_non_test})
+
+    ranked: list[tuple[int, str]] = []
+    for tp in tracked_tests:
+        if tp in used or tp in changed_tests:
+            continue
+        score = 0
+        tpn = tp.replace("\\", "/").lower()
+        for d in dirs:
+            if d and d in tp:
+                score += 3
+                break
+        for st in stems:
+            if len(st) >= 3 and st.lower() in Path(tp).stem.lower():
+                score += 2
+                break
+        if score:
+            ranked.append((score, tp))
+    ranked.sort(key=lambda z: (-z[0], z[1]))
+
+    def add(rel: str, source: str) -> None:
+        nonlocal out
+        if rel in used or len(out) >= TEST_CONTEXT_MAX_WINDOWS:
+            return
+        try:
+            blob = get_blob_at_sha(repo_path, base_sha, rel)
+            lines_l = blob.splitlines()
+            hi = min(len(lines_l), TEST_MAX_LINES_PER_WINDOW)
+            if hi < 1:
+                return
+            out.append(
+                {
+                    "path": rel,
+                    "role": "tests",
+                    "source": source,
+                    "line_start": 1,
+                    "line_end": hi,
+                    "text": numbered_text(lines_l, 1, hi),
+                }
+            )
+            used.add(rel)
+        except Exception:
+            return
+
+    for ct in dict.fromkeys(changed_tests):
+        add(ct, "changed_test_file")
+        if len(out) >= TEST_CONTEXT_MAX_WINDOWS:
+            return out
+
+    for _score, tp in ranked:
+        add(tp, "nearest_tracked_test")
+        if len(out) >= TEST_CONTEXT_MAX_WINDOWS:
+            break
+
+    return out
 
 
 def approx_tokens(text: str) -> int:
@@ -603,9 +1076,13 @@ def validate_record(record: dict[str, Any], id_set: set[str]) -> list[str]:
     if not diff_has_unified_format(diff):
         errs.append("invalid_unified_diff")
 
-    allowed = set(record.get("input", {}).get("constraints", {}).get("allowed_files", []))
+    inp = record.get("input", {})
+    allowed_edits = inp.get("allowed_edit_files") or inp.get("constraints", {}).get("allowed_files") or []
+    allowed = set(allowed_edits)
     touched = set(out.get("touched_files", []))
-    if not touched.issubset(allowed):
+    if not allowed:
+        errs.append("missing_allowed_edit_files")
+    elif not touched.issubset(allowed):
         errs.append("touched_outside_allowed")
 
     # JSON serializable / parseable.
@@ -644,14 +1121,14 @@ def build_record(
         drop_counts["no_files_json"] += 1
         return None
 
-    py_files = []
-    selected_files = []
-    diff_blocks = []
-    touched_files = []
-    all_hunk_headers = []
-    ts_spans = []
+    py_files: list[dict[str, Any]] = []
+    selected_files: list[dict[str, Any]] = []
+    diff_blocks: list[str] = []
+    touched_files: list[str] = []
+    all_hunk_headers: list[dict[str, int]] = []
+    ts_spans: list[dict[str, Any]] = []
     span_stats = {"ast_spans": 0, "fallback_spans": 0}
-    file_statuses = {}
+    file_statuses: dict[str, str] = {}
 
     for f in files:
         fname = normalize_file_path(f.get("filename", ""))
@@ -679,12 +1156,14 @@ def build_record(
                     patch,
                 )
                 ts_spans.extend(spans_for_file)
-                span_stats["ast_spans"] += sum(1 for s in spans_for_file if s.get("symbol_type") != "fallback_hunk_window")
-                span_stats["fallback_spans"] += sum(1 for s in spans_for_file if s.get("symbol_type") == "fallback_hunk_window")
+                span_stats["ast_spans"] += sum(
+                    1 for s in spans_for_file if s.get("symbol_type") != "fallback_hunk_window"
+                )
+                span_stats["fallback_spans"] += sum(
+                    1 for s in spans_for_file if s.get("symbol_type") == "fallback_hunk_window"
+                )
             except RuntimeError:
-                # Do not kill full build for occasional historical/rename mismatches.
                 drop_counts["treesitter_blob_lookup_failures"] += 1
-                # Last-resort fallback from patch hunk headers without base blob text.
                 headers = parse_hunk_headers(patch)
                 if headers:
                     h = headers[0]
@@ -717,10 +1196,11 @@ def build_record(
         drop_counts["too_many_files"] += 1
         return None
 
-    # Recompute totals on selected files only for precision.
     selected_additions = int(sum(int(f.get("additions", 0) or 0) for f in selected_files))
     selected_deletions = int(sum(int(f.get("deletions", 0) or 0) for f in selected_files))
-    selected_patch_tokens = int(sum(len((f.get("patch") or "").split()) for f in selected_files if f.get("patch")))
+    selected_patch_tokens = int(
+        sum(len((f.get("patch") or "").split()) for f in selected_files if f.get("patch"))
+    )
     if selected_additions > cfg.max_additions:
         drop_counts["too_many_additions"] += 1
         return None
@@ -733,30 +1213,58 @@ def build_record(
         drop_counts["invalid_unified_diff"] += 1
         return None
 
-    planner_directive = {
-        "requires_code_change": "YES",
-        "confidence": "MEDIUM",
-        "reason": "Issue requires code modifications in target files.",
-        "root_cause": (str(row.get("pr_body", "")) or str(row.get("pr_title", "")) or "Unknown root cause.")[:220],
-        "target_files": [normalize_file_path(f.get("filename", "")) for f in selected_files],
-        "target_functions": [s["symbol"] for s in ts_spans if s.get("touched_by_gold_patch")][:8],
-        "test_strategy": "Update/add focused unit tests for modified behavior.",
-    }
+    allowed_edit_files = list(dict.fromkeys(touched_files))
+    primary_paths_set = set(touched_files)
+    touched_line_by_file: dict[str, set[int]] = {}
+    for sf in selected_files:
+        fp = normalize_file_path(sf.get("filename", ""))
+        patch_t = sf.get("patch") or ""
+        touched_line_by_file[fp] = touched_lines_from_patch_headers(parse_hunk_headers(patch_t))
 
-    issue_context = {
-        "title": str(row.get(cfg.issue_title_col, ""))[:200],
-        "body": str(row.get(cfg.issue_body_col, ""))[:1200],
-        "labels": parse_labels(row.get(cfg.issue_labels_col, "")),
-        "comments_summary": str(row.get(cfg.issue_comments_col, ""))[:1000],
-    }
+    selected_py_sources: dict[str, str] = {}
+    for sf in selected_files:
+        fp = normalize_file_path(sf.get("filename", ""))
+        if fp.endswith(".py"):
+            try:
+                selected_py_sources[fp] = get_blob_at_sha(cfg.repo_path, base_sha, fp)
+            except Exception:
+                continue
 
-    if cfg.enable_graphrag:
+    file_context_primary: list[dict[str, Any]] = []
+    for sf in selected_files:
+        fp = normalize_file_path(sf.get("filename", ""))
+        pt = sf.get("patch") or ""
+        try:
+            file_context_primary.extend(
+                build_primary_windows(cfg.repo_path, base_sha, fp, pt, cfg)
+            )
+        except RuntimeError:
+            drop_counts["primary_context_blob_miss"] += 1
+            if pt:
+                h = parse_hunk_headers(pt)
+                ln0 = int(h[0]["old_start"]) if h else 1
+                file_context_primary.append(
+                    {
+                        "path": fp,
+                        "role": "primary",
+                        "source": "changed_in_pr",
+                        "presentation": "fallback_patch_only",
+                        "line_start": ln0,
+                        "line_end": ln0 + 40,
+                        "text": numbered_text(pt.splitlines(), 1, min(40, max(1, len(pt.splitlines())))),
+                    }
+                )
+
+    if cfg.enable_graphrag and neo4j_session is not None:
         graphrag_context = graphrag_for_files(
             neo4j_session,
-            planner_directive["target_files"],
+            allowed_edit_files,
             cfg.graphrag_top_k,
         )
         graphrag_context["query_version"] = cfg.graphrag_query_version
+        graph_neighbor_paths = [
+            normalize_file_path(str(x.get("file", ""))) for x in graphrag_context.get("candidate_files_topk") or []
+        ]
     else:
         graphrag_context = {
             "enabled": False,
@@ -765,20 +1273,90 @@ def build_record(
             "historical_idioms": [],
             "historical_ci_stats": {},
         }
+        graph_neighbor_paths = []
+
+    file_context_supporting = build_supporting_windows(
+        cfg.repo_path,
+        base_sha,
+        primary_paths_set,
+        selected_py_sources,
+        touched_line_by_file,
+        cfg,
+        graph_neighbor_paths=graph_neighbor_paths,
+    )
+
+    changed_tests_paths = [p for p in touched_files if is_probable_test_path(p)]
+    tracked_test_paths = frozenset(p for p in cfg.tracked_py_paths if is_probable_test_path(p))
+    file_context_tests = nearest_test_snapshots(
+        cfg.repo_path,
+        base_sha,
+        touched_files,
+        tracked_test_paths,
+        changed_tests_paths,
+    )
+
+    pr_title_txt = str(row.get("pr_title", "") or "").strip()
+    pr_body_txt = str(row.get("pr_body", "") or "").strip()
+    issue_title_txt = str(row.get(cfg.issue_title_col, "") or "").strip()
+    issue_body_txt = str(row.get(cfg.issue_body_col, "") or "").strip()
+
+    planner_reason_parts: list[str] = []
+    if issue_title_txt or issue_body_txt:
+        planner_reason_parts.append(
+            f"[issue_context] {(issue_title_txt + ' · ' + issue_body_txt)[:1500]}".strip()
+        )
+    if pr_title_txt or pr_body_txt:
+        planner_reason_parts.append(
+            f"[pr_metadata] {(pr_title_txt + ' · ' + pr_body_txt)[:1500]}".strip()
+        )
+    if not planner_reason_parts:
+        planner_reason_parts.append("Historical merged PR reconstruction (minimal issue metadata present).")
+
+    plan_entries = [
+        {
+            "file": normalize_file_path(f.get("filename", "")),
+            "what_to_change": (
+                f"Implement the validated fix touching this path (merged PR #{pr_number}); "
+                f"mirror intent from PR/issue narrative without unrelated refactors."
+            )[:580],
+        }
+        for f in selected_files
+    ]
+
+    planner_directive = {
+        "requires_code_change": "YES",
+        "reason": (" ".join(planner_reason_parts))[:2400],
+        "confidence": "MEDIUM",
+        "proxy_source": "issue_pr_metadata_reconstruction",
+        "plan": plan_entries,
+        "scope_target_files": allowed_edit_files,
+        "signals": {
+            "target_symbols_touched_estimate": [
+                s["symbol"] for s in ts_spans if s.get("touched_by_gold_patch")
+            ][:16],
+            "recommended_test_touch": changed_tests_paths[:8],
+            "test_nearby_budget": TEST_CONTEXT_MAX_WINDOWS,
+        },
+    }
+
+    issue_context = {
+        "title": issue_title_txt[:200] if issue_title_txt else pr_title_txt[:200],
+        "body": (issue_body_txt or pr_body_txt)[:1500],
+        "labels": parse_labels(row.get(cfg.issue_labels_col, "")),
+        "comments_summary": str(row.get(cfg.issue_comments_col, ""))[:1000],
+    }
 
     constraints = {
-        "allowed_files": planner_directive["target_files"],
+        "allowed_files": allowed_edit_files,
         "forbid_new_files": True,
         "forbid_unrelated_refactors": True,
         "output_format": "unified_diff_only",
     }
 
-    # Quality labels
     valid_diff = diff_has_unified_format(unified_diff)
-    touches_only_allowed = set(planner_directive["target_files"]).issuperset(set(touched_files))
+    touches_only_allowed = set(allowed_edit_files).issuperset(set(touched_files))
     structural_pass = True
     compile_pass = True
-    # Syntax-level check from applying patch against base blobs.
     for f in py_files:
         fp = normalize_file_path(f.get("filename", ""))
         try:
@@ -800,20 +1378,27 @@ def build_record(
     }
 
     instruction = (
-        "Generate a minimal unified diff that implements the planner directive exactly. "
-        "Edit only allowed files, do not create new files, and avoid unrelated refactors. "
-        "Output ONLY unified diff text."
+        "You simulate the inference-time patcher. Read planner_directive (scope-only) "
+        "and file_contexts (primary changed files, deterministic supporting snippets, nearest tests). "
+        "Generate a minimal unified diff that satisfies the planner scope; edits only paths in "
+        "allowed_edit_files. Output ONLY unified diff text."
     )
 
     record = {
         "id": f"{repo}#pr{pr_number}",
-        "split": None,  # assigned later
+        "split": None,
         "repo": repo,
         "task_type": "patch_generation",
         "input": {
             "instruction": instruction,
             "planner_directive": planner_directive,
             "issue_context": issue_context,
+            "file_contexts": {
+                "primary": file_context_primary,
+                "supporting": file_context_supporting,
+                "tests": file_context_tests,
+            },
+            "allowed_edit_files": allowed_edit_files,
             "treesitter_context": {
                 "language": "python",
                 "base_sha": base_sha,
@@ -832,11 +1417,15 @@ def build_record(
             "selected_total_additions": selected_additions,
             "selected_total_deletions": selected_deletions,
             "selected_total_patch_tokens": selected_patch_tokens,
-            # Backward-compatible aliases retained for existing dashboards/scripts.
             "py_files_touched": selected_files_touched,
             "py_total_additions": selected_additions,
             "py_total_deletions": selected_deletions,
             "py_total_patch_tokens": selected_patch_tokens,
+            "file_context_shapes": {
+                "primary_segments": len(file_context_primary),
+                "supporting_segments": len(file_context_supporting),
+                "tests_segments": len(file_context_tests),
+            },
             "quality_labels": {
                 "valid_diff": valid_diff,
                 "touches_only_allowed_files": touches_only_allowed,
@@ -847,10 +1436,11 @@ def build_record(
                 "source_dataset": str(cfg.input_path),
                 "repo_path": str(cfg.repo_path),
                 "graphrag_enabled": cfg.enable_graphrag,
-                "treesitter_enabled": cfg.enable_treesitter,
+                "treesitter_legacy_spans_enabled": cfg.enable_treesitter,
                 "seed": cfg.seed,
                 "ast_span_count": span_stats["ast_spans"],
                 "fallback_span_count": span_stats["fallback_spans"],
+                "context_builder": "historical_orchestrator_proxy_v1",
             },
         },
     }
@@ -870,7 +1460,8 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     setup_logging()
-    cfg = parse_args()
+    tracked_py = git_list_tracked_paths(REPO_ROOT)
+    cfg = build_default_config(tracked_py)
     random.seed(cfg.seed)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -927,6 +1518,15 @@ def main() -> None:
     LOG.info("Dropped records: %d", sum(drop_counts.values()))
 
     train, eval_, test = stratified_pr_split(kept, cfg)
+    if cfg.max_train_examples is not None and len(train) > cfg.max_train_examples:
+        rng_sub = random.Random(cfg.seed + 4133)
+        rng_sub.shuffle(train)
+        train = train[: cfg.max_train_examples]
+        LOG.info(
+            "Capped train set to max_train_examples=%d (%d rows kept)",
+            cfg.max_train_examples,
+            len(train),
+        )
     for r in train:
         r["split"] = "train"
     for r in eval_:
@@ -1003,6 +1603,7 @@ def main() -> None:
             "graphrag_top_k": cfg.graphrag_top_k,
             "treesitter_enabled": cfg.enable_treesitter,
             "seed": cfg.seed,
+            "max_train_examples": cfg.max_train_examples,
         },
         "span_enrichment": {
             "rows_with_any_span": sum(1 for r in kept if r["input"]["treesitter_context"]["spans"]),
@@ -1078,6 +1679,8 @@ def main() -> None:
         print(
             f"id={row['id']} split={row['split']} files={len(row['output']['touched_files'])} "
             f"spans={len(row['input']['treesitter_context']['spans'])} "
+            f"fc_sup={len(row['input'].get('file_contexts', {}).get('supporting') or [])} "
+            f"fc_tst={len(row['input'].get('file_contexts', {}).get('tests') or [])} "
             f"gr_candidates={len(row['input']['graphrag_context']['candidate_files_topk'])}"
         )
         print(

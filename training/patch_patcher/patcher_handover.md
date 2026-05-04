@@ -127,6 +127,16 @@ Recommended patcher fine-tuning profile (Qwen2.5-Coder-7B):
 - batch size ~4 (with grad accumulation)
 - LR ~5e-5 (drop to 2.5e-5 if unstable)
 
+**How many training examples?** The repo does not fix a single minimum: quality and diversity matter more than a magic `N`. Practical ranges for LoRA SFT on this stack:
+
+| Goal | Rough train size | Notes |
+|------|------------------|--------|
+| Sanity check / iteration speed | ~1k–2k | Enough to see loss move and spot broken formatting; not a production gate. |
+| Reasonable first adapter | ~4k–8k | Often a good cost/quality tradeoff if examples are strict and eval-tracked. |
+| Full pipeline | ~10k–20k+ | Diminishing returns per epoch; longer runs mostly help edge cases. |
+
+To **shorten Colab wall time**, reduce train rows (fewer optimizer steps per epoch), not eval: keep `patcher_eval.jsonl` large enough to track `eval_loss` and format metrics. In `build_patcher_data.py`, set **`MAX_TRAIN_EXAMPLES`** (e.g. `5000`) to cap the train split after the 80/10/10 stratified split; eval/test counts stay the same. Alternatively subsample `patcher_train.jsonl` in a notebook before loading.
+
 Use `patcher_train.jsonl` as train source and track:
 - valid diff rate
 - touches-only-allowed-files rate
