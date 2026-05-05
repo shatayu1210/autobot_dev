@@ -19,6 +19,14 @@ This folder contains the local Neo4j GraphRAG setup used to enrich planner/patch
 
 ### 1) Start Neo4j
 
+**Preferred — root compose (brings up only Neo4j):**
+```bash
+# From the repo root
+cd autobot_dev
+docker compose up neo4j -d
+```
+
+**Standalone (this directory only):**
 ```bash
 cd autobot_dev/graphrag
 docker compose up -d

@@ -70,7 +70,7 @@ It handles issue fetching, planner calls, patcher/critic loops, and GitHub
 API integration.
 
 ```bash
-cd autobot-vscode/local_orchestrator
+cd autobot_vscode/local_orchestrator
 
 # Copy environment template
 cp .env.example .env
@@ -189,7 +189,7 @@ you interact with the Planner → Patcher → Critic pipeline.
 ### 5a. Compile the extension
 
 ```bash
-cd autobot-vscode
+cd autobot_vscode
 npm install
 npm run compile
 ```
@@ -197,7 +197,7 @@ npm run compile
 ### 5b. Launch in Extension Development Host
 
 1. Open VS Code.
-2. `File → Open Folder` → select `autobot-vscode/`.
+2. `File → Open Folder` → select `autobot_vscode/`.
 3. Press `F5` (or `Run → Start Debugging`).
 4. A new **Extension Development Host** VS Code window opens.
 
@@ -319,12 +319,12 @@ Use this checklist before a full demo:
 
 - [ ] Ollama app is open (menu bar icon visible)
 - [ ] `qwen2.5-coder:7b` model is pulled (`ollama list`)
-- [ ] Orchestrator running: `python3 autobot-vscode/local_orchestrator/app.py`
+- [ ] Orchestrator running: `python3 autobot_vscode/local_orchestrator/app.py`
   - [ ] `GITHUB_TOKEN` set in orchestrator `.env` for live issue data
   - [ ] `AUTOBOT_MODE=ollama` (or `google_ai` / `vertex` for demo quality)
 - [ ] MCP server running: `cd slackbot && MCP_TRANSPORT=sse python3 mcp_server.py`
-- [ ] VS Code extension compiled (`npm run compile` in `autobot-vscode/`)
-- [ ] Extension Development Host open (F5 from `autobot-vscode/` in VS Code)
+- [ ] VS Code extension compiled (`npm run compile` in `autobot_vscode/`)
+- [ ] Extension Development Host open (F5 from `autobot_vscode/` in VS Code)
 - [ ] Repo path set to `tree_sitter/airflow/` in AutoBot chat sidebar
 - [ ] Neo4j running (`docker ps` shows neo4j container) [optional but recommended]
 - [ ] Tree-sitter index exists at `tree_sitter/treesitter_index.json`
@@ -337,7 +337,7 @@ Use this checklist before a full demo:
 |---|---|
 | Chat shows "Stub issue" | Add `GITHUB_TOKEN` to `local_orchestrator/.env` and restart orchestrator |
 | Orchestrator error "ollama not reachable" | Open the Ollama macOS app (look for menu bar icon) |
-| `tsc: command not found` | Run `npm install` first inside `autobot-vscode/` |
+| `tsc: command not found` | Run `npm install` first inside `autobot_vscode/` |
 | Extension not visible in sidebar | Make sure Extension Development Host window is focused, not the main VS Code window |
 | Flask 502/connection refused | Make sure `python3 app.py` is running in `local_orchestrator/` |
 | Plan always returns stub | Set `AUTOBOT_MODE=ollama` (not `stub`) in orchestrator `.env` |

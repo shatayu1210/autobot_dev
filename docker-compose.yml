@@ -1,0 +1,258 @@
+# AutoBot — Root Docker Compose
+#
+# Usage (bring up only what you need):
+#   docker compose up neo4j                        # GraphRAG only
+#   docker compose up sandbox                      # Patcher validation sandbox
+#   docker compose up neo4j langfuse grafana loki  # Dev + full observability
+#   docker compose up                              # Everything
+#
+# Required env vars: copy .env.example to .env and fill in values.
+
+name: autobot
+
+x-airflow-common:
+  &airflow-common
+  build: ./etl
+  image: autobot-etl-airflow:latest
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@etl-postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    GITHUB_TOKEN: ${GITHUB_TOKEN}
+    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-}
+    SNOWFLAKE_USER: ${SNOWFLAKE_USER:-}
+    SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD:-}
+    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-}
+    SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE:-}
+    GCS_BUCKET: ${GCS_BUCKET:-}
+    GCS_PROJECT_ID: ${GCS_PROJECT_ID:-}
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/gcs_credentials.json
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-./etl}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-./etl}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-./etl}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-./etl}:/opt/airflow/code_v2
+    - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/opt/airflow/gcs_credentials.json:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    etl-postgres:
+      condition: service_healthy
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # GraphRAG — Neo4j
+  # Bring up: docker compose up neo4j
+  # ────────────────────────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.18.1
+    container_name: autobot_neo4j
+    ports:
+      - "7474:7474"   # Browser UI  → http://localhost:7474
+      - "7687:7687"   # Bolt        → bolt://localhost:7687
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-autobot_password}
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_memory_heap_initial__size: 1G
+      NEO4J_dbms_memory_heap_max__size: 4G
+      NEO4J_dbms_memory_pagecache_size: 2G
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_export_file_enabled: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - ./graphrag/import:/var/lib/neo4j/import
+      - ./graphrag/plugins:/plugins
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Patcher Sandbox
+  # Isolated environment to apply patches and run pytest against Airflow.
+  # POST /run_tests { diff, test_files } → { passed, output }
+  # Bring up: docker compose up sandbox
+  # ────────────────────────────────────────────────────────────────────────────
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    container_name: autobot_sandbox
+    ports:
+      - "5001:5001"
+    environment:
+      AIRFLOW_REPO_PATH: /workspace
+    volumes:
+      # Mount the Airflow repo as READ-ONLY so the sandbox can run tests
+      # but cannot permanently modify the source.
+      - ${AIRFLOW_REPO_PATH:-./tree_sitter/airflow}:/workspace:ro
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # ETL — Airflow (only bring up for pipeline runs)
+  # Bring up: docker compose up airflow-webserver airflow-scheduler
+  # ────────────────────────────────────────────────────────────────────────────
+  etl-postgres:
+    image: postgres:16
+    container_name: autobot_etl_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - etl_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: autobot_airflow_webserver
+    command: webserver
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: autobot_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: autobot_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-./etl}:/sources
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Observability — Langfuse (LLM tracing)
+  # UI → http://localhost:3000  (create account on first visit)
+  # Bring up: docker compose up langfuse
+  # ────────────────────────────────────────────────────────────────────────────
+  langfuse-db:
+    image: postgres:16
+    container_name: autobot_langfuse_db
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "langfuse"]
+      interval: 10s
+      retries: 5
+
+  langfuse:
+    image: langfuse/langfuse:latest
+    container_name: autobot_langfuse
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse}@langfuse-db/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_SECRET:-changeme-generate-a-real-secret}
+      SALT: ${LANGFUSE_SALT:-changeme-generate-a-real-salt}
+      TELEMETRY_ENABLED: "false"
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Observability — Loki + Grafana (centralised logging)
+  # Grafana UI → http://localhost:3001  (admin / admin by default)
+  # Bring up: docker compose up loki grafana
+  # ────────────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: autobot_loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: autobot_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Observability — Prometheus (metrics scraping, for later)
+  # UI → http://localhost:9090
+  # Bring up: docker compose up prometheus
+  # ────────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: autobot_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  etl_postgres_data:
+  langfuse_db_data:
+  grafana_data:
+  prometheus_data:
