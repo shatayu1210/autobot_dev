@@ -1,0 +1,55 @@
+============================================================
+REASONER TRAIN/VAL/TEST SPLIT REPORT
+============================================================
+
+Total records : 2579
+Train         : 2084 (80.8%)
+Val           : 249 (9.7%)
+Test          : 246 (9.5%)
+
+--- Band Distribution ---
+  Train:
+    medium: 1553 (74.5%)
+    high: 531 (25.5%)
+  Val:
+    medium: 184 (73.9%)
+    high: 65 (26.1%)
+  Test:
+    medium: 177 (72.0%)
+    high: 69 (28.0%)
+
+--- Tier Distribution ---
+  Train: {'T+22': 524, 'T+15': 440, 'T+29': 407, 'T+36': 324, 'T+44': 275, 'T+7': 114}
+  Val: {'T+22': 61, 'T+15': 56, 'T+29': 47, 'T+36': 39, 'T+44': 34, 'T+7': 12}
+  Test: {'T+22': 63, 'T+15': 52, 'T+29': 50, 'T+36': 38, 'T+44': 25, 'T+7': 18}
+
+--- Tier by Band (skew check) ---
+  Train:
+    medium: {'T+15': '27%', 'T+22': '24%', 'T+29': '17%', 'T+36': '13%', 'T+44': '11%', 'T+7': '7%'}
+    high: {'T+15': '4%', 'T+22': '27%', 'T+29': '28%', 'T+36': '22%', 'T+44': '20%', 'T+7': '0%'}
+  Val:
+    medium: {'T+15': '29%', 'T+22': '24%', 'T+29': '16%', 'T+36': '14%', 'T+44': '11%', 'T+7': '7%'}
+    high: {'T+15': '5%', 'T+22': '25%', 'T+29': '28%', 'T+36': '22%', 'T+44': '22%'}
+  Test:
+    medium: {'T+15': '28%', 'T+22': '24%', 'T+29': '17%', 'T+36': '12%', 'T+44': '9%', 'T+7': '10%'}
+    high: {'T+15': '4%', 'T+22': '30%', 'T+29': '29%', 'T+36': '23%', 'T+44': '13%'}
+
+--- Evidence Type Distribution (train) ---
+  no_assignee: 1618
+  multiple_prs: 498
+  no_comments: 463
+  many_comments_no_code: 353
+  no_special_evidence: 197
+  approved_pr_stalled: 13
+  closed_without_merge: 1
+
+--- Rare Evidence Types in Val/Test ---
+  Val: none (expected)
+  Test: none (expected)
+
+--- Validation Failures ---
+  Train: 8 validation_passed=False records
+  Val: 0 validation_passed=False records
+  Test: 0 validation_passed=False records
+
+--- Issue Leakage Check ---

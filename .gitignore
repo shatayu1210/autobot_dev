@@ -252,3 +252,5 @@ training/**/*_graphrag_v*.jsonl
 
 # Keep training_data docs, ignore large JSONL payloads
 etl/training_data/*.jsonl
+seen_issues.db
+scratch/
