@@ -254,3 +254,4 @@ training/**/*_graphrag_v*.jsonl
 etl/training_data/*.jsonl
 seen_issues.db
 scratch/
+.langgraph_api/
