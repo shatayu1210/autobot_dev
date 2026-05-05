@@ -23,6 +23,8 @@ CHAT_HISTORY = {}
 # Bottleneck prompt-engineering helpers (bottleneck_issue_to_msg.py)
 import bottleneck_issue_to_msg as btm
 
+import dpo_feedback
+
 load_dotenv()
 
 # ── Vertex AI / GCP setup ─────────────────────────────────────────────────────
@@ -316,6 +318,126 @@ def handle_message_lazy(event, client, request):
 
 bolt_app.event("message")(ack=handle_message_ack, lazy=[handle_message_lazy])
 
+
+# ── DPO feedback: thumbs-down on bot replies → Postgres ───────────────────────
+_CACHE_BOT_USER_ID = None
+
+
+def _bot_user_id(client) -> str:
+    uid = os.getenv("SLACK_BOT_USER_ID", "").strip()
+    if uid:
+        return uid
+    global _CACHE_BOT_USER_ID
+    if _CACHE_BOT_USER_ID is None:
+        _CACHE_BOT_USER_ID = client.auth_test()["user_id"]
+    return _CACHE_BOT_USER_ID
+
+
+def _reaction_is_thumbs_down(name: str) -> bool:
+    n = (name or "").strip().lower().replace(" ", "")
+    return n in ("thumbsdown", "-1", "thumbs_down")
+
+
+def handle_reaction_added_ack(ack):
+    ack()
+
+
+def handle_reaction_added_lazy(event, client, request):
+    if request.headers.get("x-slack-retry-num"):
+        print(f"DEBUG [{VERSION}]: Skipping retry for reaction_added (lazy)")
+        return
+    if os.getenv("DPO_FEEDBACK_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return
+    if not dpo_feedback.database_url():
+        return
+
+    reaction_name = event.get("reaction") or ""
+    if not _reaction_is_thumbs_down(reaction_name):
+        return
+
+    item = event.get("item") or {}
+    if item.get("type") != "message":
+        return
+
+    channel_id = item.get("channel")
+    message_ts = item.get("ts")
+    reactor_user_id = event.get("user") or ""
+
+    if not channel_id or not message_ts:
+        print(f"DPO: reaction_added missing channel/ts: {event!r}")
+        return
+
+    bot_user_id = _bot_user_id(client)
+
+    if os.getenv("DPO_FEEDBACK_ENSURE_SCHEMA", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            dpo_feedback.ensure_schema()
+        except Exception as e:
+            print(f"DPO: ensure_schema failed: {e}")
+
+    try:
+        hist = client.conversations_history(
+            channel=channel_id,
+            latest=message_ts,
+            oldest=message_ts,
+            inclusive=True,
+            limit=1,
+        )
+        hist_msgs = hist.get("messages") or []
+        if not hist_msgs:
+            print(f"DPO: conversations_history returned no rows for ts={message_ts}")
+            return
+        root = hist_msgs[0]
+        thread_ts = root.get("thread_ts") or root.get("ts")
+        rep = client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
+            limit=200,
+        )
+        thread_msgs = rep.get("messages") or []
+        prompt_text, rejected_text, meta = dpo_feedback.resolve_prompt_and_rejected(
+            thread_msgs,
+            reacted_ts=message_ts,
+            bot_user_id=bot_user_id,
+        )
+        meta["reaction"] = reaction_name
+        meta["slack_channel"] = channel_id
+        if not meta.get("rejected_from_bot_message"):
+            print(
+                f"DPO: skipping — reacted message ts={message_ts} is not a bot-authored reply"
+            )
+            return
+
+        slack_team_id = event.get("team_id") or event.get("team")
+        if isinstance(slack_team_id, dict):
+            slack_team_id = slack_team_id.get("id")
+        slack_team_id = slack_team_id or None
+
+        if dpo_feedback.insert_feedback_event(
+            slack_team_id=slack_team_id,
+            channel_id=channel_id,
+            message_ts=message_ts,
+            reactor_user_id=reactor_user_id,
+            prompt_text=prompt_text,
+            rejected_text=rejected_text,
+            metadata=meta,
+            reaction=reaction_name or "thumbsdown",
+        ):
+            print(
+                f"DPO: stored thumbs-down feedback "
+                f"channel={channel_id} msg_ts={message_ts} reactor={reactor_user_id}"
+            )
+    except Exception as e:
+        print(f"DPO: reaction_added handler failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
+bolt_app.event("reaction_added")(
+    ack=handle_reaction_added_ack,
+    lazy=[handle_reaction_added_lazy],
+)
 
 
 # ── Flask server ───────────────────────────────────────────────────────────────

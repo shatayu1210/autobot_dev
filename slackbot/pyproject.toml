@@ -23,4 +23,6 @@ dependencies = [
     "peft>=0.18.1",
     "mcp[cli]>=1.26.0",
     "requests>=2.32.5",
+    "psycopg[binary]>=3.1",
+    "sqlparse>=0.5.0",
 ]
