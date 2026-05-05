@@ -1,5 +1,5 @@
 {
-  "name": "autobot-vscode",
+  "name": "autobot_vscode",
   "displayName": "AutoBot — Planner · Patcher · Critic",
   "description": "VS Code UI for AutoBot orchestration (Planner → Patcher → Critic). Talks to your Flask/orchestrator HTTP API.",
   "version": "0.1.0",

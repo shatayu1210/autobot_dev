@@ -1,0 +1,622 @@
+/* ── Base ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Layout ──────────────────────────────────────────── */
+#ab-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
+  flex-shrink: 0;
+}
+
+#ab-header .ab-logo {
+  font-size: 1.1em;
+}
+
+#ab-header .ab-title {
+  font-weight: 600;
+  font-size: 0.95em;
+  letter-spacing: 0.01em;
+}
+
+#ab-header .ab-badge {
+  margin-left: auto;
+  font-size: 0.72em;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: var(--vscode-badge-background, #0e639c);
+  color: var(--vscode-badge-foreground, #fff);
+  letter-spacing: 0.04em;
+}
+
+/* ── Config bar (repo path + issue #) ─────────────────── */
+#ab-config {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ab-cfg-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ab-cfg-row label {
+  font-size: 0.78em;
+  opacity: 0.75;
+  white-space: nowrap;
+  flex-shrink: 0;
+  width: 64px;
+}
+
+.ab-cfg-row input[type="text"] {
+  flex: 1;
+  padding: 3px 6px;
+  font-size: 0.82em;
+  border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.4));
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border-radius: 3px;
+  outline: none;
+  min-width: 0;
+}
+
+.ab-cfg-row input[type="text"]:focus {
+  border-color: var(--vscode-focusBorder, #0e639c);
+}
+
+.ab-icon-btn {
+  background: none;
+  border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.35));
+  color: var(--vscode-foreground);
+  border-radius: 3px;
+  padding: 2px 7px;
+  font-size: 0.82em;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+.ab-icon-btn:hover { opacity: 1; }
+
+/* ── Chat feed ────────────────────────────────────────── */
+#ab-chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 10px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scroll-behavior: smooth;
+}
+
+/* Scrollbar */
+#ab-chat::-webkit-scrollbar { width: 4px; }
+#ab-chat::-webkit-scrollbar-track { background: transparent; }
+#ab-chat::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background, rgba(128,128,128,0.3));
+  border-radius: 4px;
+}
+
+/* ── Message bubbles ──────────────────────────────────── */
+.ab-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 100%;
+  animation: ab-fadeIn 0.18s ease;
+}
+
+@keyframes ab-fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.ab-msg-user .ab-bubble {
+  align-self: flex-end;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  border-radius: 12px 12px 3px 12px;
+  padding: 7px 11px;
+  font-size: 0.88em;
+  max-width: 90%;
+  word-break: break-word;
+  line-height: 1.45;
+}
+
+.ab-msg-agent .ab-bubble {
+  align-self: flex-start;
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(128,128,128,0.12));
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+  border-radius: 3px 12px 12px 12px;
+  padding: 9px 11px;
+  font-size: 0.87em;
+  max-width: 100%;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.ab-msg-label {
+  font-size: 0.72em;
+  opacity: 0.55;
+  padding: 0 2px;
+}
+
+.ab-msg-user .ab-msg-label { text-align: right; }
+
+/* ── Tool activity steps (thinking) ──────────────────── */
+.ab-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 4px 0 10px 4px;
+  border-left: 2px solid var(--vscode-widget-border, rgba(128,128,128,0.25));
+  padding-left: 12px;
+}
+
+.ab-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8em;
+  padding: 4px 0;
+  position: relative;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.ab-step::before {
+  content: '';
+  position: absolute;
+  left: -17px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--vscode-editor-background);
+  border: 2px solid var(--vscode-widget-border, rgba(128,128,128,0.25));
+  z-index: 1;
+}
+
+.ab-step.active { 
+  opacity: 1; 
+  font-weight: 500;
+  color: var(--vscode-textLink-foreground, #4daafc);
+}
+
+.ab-step.active::before {
+  border-color: var(--vscode-textLink-foreground, #4daafc);
+  background: var(--vscode-textLink-foreground, #4daafc);
+  box-shadow: 0 0 4px var(--vscode-textLink-foreground, #4daafc);
+}
+
+.ab-step.done { 
+  opacity: 0.5; 
+}
+
+.ab-step.done::before {
+  border-color: var(--vscode-testing-iconPassed, #4ec94e);
+  background: var(--vscode-testing-iconPassed, #4ec94e);
+}
+
+.ab-step-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── Spinner ──────────────────────────────────────────── */
+.ab-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: ab-spin 0.6s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes ab-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Plan card ────────────────────────────────────────── */
+.ab-plan-card {
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.25));
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 6px 0;
+}
+
+/* \u2500\u2500 Query Answer Card \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+.ab-query-card {
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.25));
+  border-radius: 6px;
+  margin: 6px 0;
+  background: var(--vscode-editor-background);
+  overflow: hidden;
+}
+.ab-query-answer {
+  padding: 10px 14px;
+  font-size: 0.86em;
+  line-height: 1.6;
+}
+.ab-query-footer {
+  border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+  padding: 5px 14px;
+  font-size: 0.68em;
+  opacity: 0.45;
+  font-family: monospace;
+}
+
+/* ── Collapsible Issue/PR Cards ───────────────────────── */
+.ab-card {
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.25));
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 6px 0;
+  background: var(--vscode-editor-background);
+}
+.ab-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: var(--vscode-editorGroupHeader-tabsBackground, rgba(128,128,128,0.08));
+  cursor: pointer;
+  user-select: none;
+}
+.ab-card-header:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.15));
+}
+.ab-card-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+  overflow: hidden;
+}
+.ab-card-title-group strong {
+  color: var(--vscode-textLink-foreground, #4daafc);
+  white-space: nowrap;
+}
+.ab-card-title-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+.ab-card-badge {
+  font-size: 0.7em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+.ab-card-badge.open { background: rgba(51,153,51,0.2); color: #4ec94e; border: 1px solid rgba(51,153,51,0.3); }
+.ab-card-badge.closed { background: rgba(200,80,80,0.2); color: #e07070; border: 1px solid rgba(200,80,80,0.3); }
+.ab-card-badge.merged { background: rgba(130,50,200,0.2); color: #b466ff; border: 1px solid rgba(130,50,200,0.3); }
+
+.ab-card-body {
+  padding: 10px;
+  font-size: 0.82em;
+  line-height: 1.5;
+  border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+  display: none;
+}
+.ab-card.expanded .ab-card-body {
+  display: block;
+}
+.ab-card-expand-icon {
+  font-size: 0.8em;
+  opacity: 0.6;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+  margin-left: 5px;
+}
+.ab-card.expanded .ab-card-expand-icon {
+  transform: rotate(180deg);
+}
+.ab-card-desc {
+  opacity: 0.8;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.ab-card-meta {
+  font-size: 0.9em;
+  opacity: 0.6;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.ab-card-meta a {
+  color: var(--vscode-textLink-foreground, #4daafc);
+  text-decoration: none;
+}
+.ab-card-meta a:hover {
+  text-decoration: underline;
+}
+
+.ab-plan-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: var(--vscode-editorGroupHeader-tabsBackground, rgba(128,128,128,0.08));
+  border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+  font-size: 0.82em;
+  font-weight: 600;
+}
+
+.ab-plan-decision {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.78em;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.ab-plan-decision.yes {
+  background: rgba(51, 153, 51, 0.2);
+  color: #4ec94e;
+  border: 1px solid rgba(51,153,51,0.35);
+}
+.ab-plan-decision.no {
+  background: rgba(200, 80, 80, 0.2);
+  color: #e07070;
+  border: 1px solid rgba(200,80,80,0.3);
+}
+
+.ab-plan-body {
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 0.83em;
+}
+
+.ab-plan-reason {
+  opacity: 0.85;
+  line-height: 1.45;
+  font-style: italic;
+}
+
+.ab-plan-files {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ab-plan-file {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-left: 2px solid var(--vscode-focusBorder, #0e639c);
+  padding-left: 8px;
+}
+
+.ab-plan-file-path {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.88em;
+  color: var(--vscode-textLink-foreground, #4daafc);
+  word-break: break-all;
+}
+
+.ab-plan-file-change {
+  opacity: 0.7;
+  line-height: 1.35;
+}
+
+.ab-confidence {
+  font-size: 0.78em;
+  opacity: 0.6;
+}
+
+.ab-refinement-badge {
+  font-size: 0.75em;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(180, 120, 0, 0.2);
+  color: #c9a227;
+  border: 1px solid rgba(180,120,0,0.3);
+}
+
+/* ── Approval / action buttons inside chat ────────────── */
+.ab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ab-btn {
+  border: none;
+  padding: 5px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.82em;
+  font-family: var(--vscode-font-family);
+  font-weight: 500;
+  transition: opacity 0.12s;
+}
+
+.ab-btn:hover { opacity: 0.85; }
+.ab-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.ab-btn-approve {
+  background: rgba(51,153,51,0.25);
+  color: #4ec94e;
+  border: 1px solid rgba(51,153,51,0.45);
+}
+
+.ab-btn-reject {
+  background: rgba(200,80,80,0.15);
+  color: #e07070;
+  border: 1px solid rgba(200,80,80,0.3);
+}
+
+.ab-btn-apply {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+}
+
+.ab-btn-pr {
+  background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.2));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.3));
+}
+
+/* ── Diff block ───────────────────────────────────────── */
+.ab-diff-wrap {
+  margin: 6px 0 0;
+}
+
+.ab-diff-label {
+  font-size: 0.75em;
+  opacity: 0.55;
+  margin-bottom: 3px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.ab-diff {
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.1));
+  border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
+  border-radius: 4px;
+  padding: 8px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.8em;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.diff-add  { color: #4ec94e; }
+.diff-del  { color: #e07070; }
+.diff-hunk { color: #7bafd4; opacity: 0.75; }
+
+/* ── Critic verdict badge ─────────────────────────────── */
+.ab-verdict {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.8em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.ab-verdict.accept {
+  background: rgba(51,153,51,0.2);
+  color: #4ec94e;
+  border: 1px solid rgba(51,153,51,0.35);
+}
+
+.ab-verdict.revise {
+  background: rgba(180,120,0,0.15);
+  color: #c9a227;
+  border: 1px solid rgba(180,120,0,0.3);
+}
+
+.ab-verdict.reject {
+  background: rgba(200,80,80,0.15);
+  color: #e07070;
+  border: 1px solid rgba(200,80,80,0.3);
+}
+
+/* ── Welcome / empty state ────────────────────────────── */
+.ab-welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  opacity: 0.45;
+  font-size: 0.88em;
+  text-align: center;
+  flex: 1;
+  padding: 20px;
+}
+
+.ab-welcome-icon { font-size: 2em; }
+
+/* ── Input bar ────────────────────────────────────────── */
+#ab-input-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 6px 10px 8px;
+  border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
+  flex-shrink: 0;
+}
+
+#ab-input {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.4));
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 0.87em;
+  font-family: var(--vscode-font-family);
+  line-height: 1.4;
+  outline: none;
+  max-height: 120px;
+  min-height: 32px;
+  overflow-y: auto;
+}
+
+#ab-input:focus {
+  border-color: var(--vscode-focusBorder, #0e639c);
+}
+
+#ab-send {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  border: none;
+  border-radius: 5px;
+  padding: 6px 11px;
+  font-size: 0.9em;
+  cursor: pointer;
+  flex-shrink: 0;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+}
+
+#ab-send:hover { opacity: 0.87; }
+#ab-send:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.ab-btn-stop {
+  background: var(--vscode-testing-iconFailed, #e07070) !important;
+}

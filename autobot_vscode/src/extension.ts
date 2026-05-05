@@ -5,7 +5,11 @@ import { setStoredToken } from "./orchestratorClient";
 export function activate(context: vscode.ExtensionContext): void {
   const provider = new PlannerPanelProvider(context);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(PlannerPanelProvider.viewType, provider)
+    vscode.window.registerWebviewViewProvider(
+      PlannerPanelProvider.viewType, 
+      provider,
+      { webviewOptions: { retainContextWhenHidden: true } }
+    )
   );
 
   context.subscriptions.push(

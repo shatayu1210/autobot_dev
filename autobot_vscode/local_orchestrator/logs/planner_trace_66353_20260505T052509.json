@@ -1,0 +1,56 @@
+{
+  "issue_number": 66353,
+  "backend": "hf_tgi",
+  "iterations": 5,
+  "final_confidence": 0.87,
+  "triggers_detected": [
+    "novel_issue",
+    "path_not_found"
+  ],
+  "research_steps_used": 41,
+  "delta_snippets": 41,
+  "passes": [
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/definitions/callback.py",
+        "Test strategy: Add unit tests to verify that the `DeadlineAlert` callback is serialized correctly when OTeL is enabled."
+      ],
+      "confidence": 0.87
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/definitions/callback.py",
+        "Test strategy: Write unit tests to verify that the `DeadlineAlert` class is now hashable and that the `consume_measurement` method no longer raises a `TypeError`."
+      ],
+      "confidence": 0.87
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/observability/metrics/otel_logger.py",
+        "Test strategy: Add unit tests to verify that the `consume_measurement` method can handle dictionaries with non-hashable values without raising a `TypeError`."
+      ],
+      "confidence": 0.87
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/observability/metrics/otel_logger.py",
+        "Test strategy: Add unit tests to verify that the `consume_measurement` method handles non-hashable values correctly."
+      ],
+      "confidence": 0.87
+    },
+    {
+      "files": [
+        "opentelemetry/sdk/metrics/_internal/_view_instrument_match.py",
+        "Test strategy: Write unit tests to verify that the `consume_measurement` method handles non-hashable values in the `attributes` dictionary without raising a `TypeError`."
+      ],
+      "confidence": 0.6
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/serde/__init__.py",
+        "Test strategy: Add unit tests to ensure that the serialization logic correctly handles non-hashable types."
+      ],
+      "confidence": 0.87
+    }
+  ]
+}

@@ -36,7 +36,7 @@ import pandas as pd
 from tqdm import tqdm
 
 try:
-    from neo4j import GraphDatabase
+from neo4j import GraphDatabase
 except Exception:
     GraphDatabase = None
 
