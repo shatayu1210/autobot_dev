@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "slack_pipeline": "./slack_orchestrator.py:pipeline"
+  },
+  "env": "../.env"
+}
