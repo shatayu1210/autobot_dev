@@ -1,0 +1,84 @@
+{
+  "name": "autobot_vscode",
+  "displayName": "AutoBot — Planner · Patcher · Critic",
+  "description": "VS Code UI for AutoBot orchestration (Planner → Patcher → Critic). Talks to your Flask/orchestrator HTTP API.",
+  "version": "0.1.0",
+  "publisher": "autobot",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:autobot.plannerPanel"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "AutoBot",
+      "properties": {
+        "autobot.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:5000",
+          "description": "Base URL of the orchestrator (Flask local server or Cloud Run URL). No trailing slash."
+        },
+        "autobot.orchestratePath": {
+          "type": "string",
+          "default": "/api/orchestrate",
+          "description": "HTTP path for POST orchestration (single endpoint contract)."
+        },
+        "autobot.requestTimeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "description": "Timeout for Planner/Patcher/Critic calls (ms). Large models may need 5+ minutes."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "autobot",
+          "title": "AutoBot",
+          "icon": "media/autobot.svg"
+        }
+      ]
+    },
+    "views": {
+      "autobot": [
+        {
+          "type": "webview",
+          "id": "autobot.plannerPanel",
+          "name": "Orchestration",
+          "contextualTitle": "Planner · Patcher · Critic"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "autobot.setApiToken",
+        "title": "AutoBot: Set API bearer token (Secret Storage)"
+      },
+      {
+        "command": "autobot.clearApiToken",
+        "title": "AutoBot: Clear API bearer token"
+      },
+      {
+        "command": "autobot.openPanel",
+        "title": "AutoBot: Open orchestration panel"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.3"
+  }
+}

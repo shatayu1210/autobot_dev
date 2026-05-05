@@ -1,0 +1,50 @@
+{
+  "issue_number": 66353,
+  "backend": "hf_tgi",
+  "iterations": 5,
+  "final_confidence": 0.6,
+  "triggers_detected": [
+    "path_not_found",
+    "novel_issue"
+  ],
+  "research_steps_used": 34,
+  "delta_snippets": 34,
+  "passes": [
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/definitions/callback.py"
+      ],
+      "confidence": 0.95
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/definitions/callback.py"
+      ],
+      "confidence": 0.95
+    },
+    {
+      "files": [
+        "opentelemetry/sdk/metrics/_internal/_view_instrument_match.py"
+      ],
+      "confidence": 0.6
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/definitions/deadline.py"
+      ],
+      "confidence": 0.95
+    },
+    {
+      "files": [
+        "task-sdk/src/airflow/sdk/definitions/deadline.py"
+      ],
+      "confidence": 0.95
+    },
+    {
+      "files": [
+        "opentelemetry/sdk/metrics/_internal/_view_instrument_match.py"
+      ],
+      "confidence": 0.6
+    }
+  ]
+}

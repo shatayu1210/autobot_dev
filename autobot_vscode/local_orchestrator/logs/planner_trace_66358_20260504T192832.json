@@ -1,0 +1,23 @@
+{
+  "issue_number": 66358,
+  "backend": "ollama",
+  "iterations": 1,
+  "final_confidence": 0.6,
+  "triggers_detected": [
+    "novel_issue",
+    "sparse_files",
+    "no_code_spans"
+  ],
+  "research_steps_used": 10,
+  "delta_snippets": 10,
+  "passes": [
+    {
+      "files": [],
+      "confidence": 0.6
+    },
+    {
+      "files": [],
+      "confidence": 0.6
+    }
+  ]
+}

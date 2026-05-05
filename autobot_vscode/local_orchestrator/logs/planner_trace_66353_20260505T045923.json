@@ -1,0 +1,39 @@
+{
+  "issue_number": 66353,
+  "backend": "ollama",
+  "iterations": 5,
+  "final_confidence": 0.6,
+  "triggers_detected": [
+    "sparse_files",
+    "no_code_change_flagged",
+    "novel_issue"
+  ],
+  "research_steps_used": 0,
+  "delta_snippets": 0,
+  "passes": [
+    {
+      "files": [],
+      "confidence": 0.6
+    },
+    {
+      "files": [],
+      "confidence": 0.6
+    },
+    {
+      "files": [],
+      "confidence": 0.6
+    },
+    {
+      "files": [],
+      "confidence": 0.6
+    },
+    {
+      "files": [],
+      "confidence": 0.6
+    },
+    {
+      "files": [],
+      "confidence": 0.6
+    }
+  ]
+}
