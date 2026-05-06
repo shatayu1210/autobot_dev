@@ -22,6 +22,7 @@ from poller import poll_once
 from sentinel import run_sentinel
 from reasoner import run_reasoner
 from notifier import run_notifier
+from adhoc import handle_adhoc_query
 
 # ── Slack client for event handling ──────────────────────────────────────────
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
@@ -121,27 +122,6 @@ def node_skip(state: PipelineState) -> PipelineState:
     print(f"[LangGraph] node_skip → cycle complete, no notifications sent")
     return {**state, "sent_count": 0, "failed_count": 0}
 
-
-# ── Adhoc stub — teammate's module plugs in here (Phase 6) ───────────────────
-
-def handle_adhoc_query(query: str, issue_number: int = None) -> str:
-    """
-    STUB — Teammate's GraphRAG + GitHub APIs module plugs in here.
-    Will be replaced in Phase 6 with replicated VS Code Orch logic.
-
-    Args:
-        query:        User's natural language query from Slack
-        issue_number: Optional issue number if mentioned in query
-
-    Returns:
-        str: Response to send back to Slack
-    """
-    print(f"[Adhoc STUB] query='{query}' issue_number={issue_number}")
-    return (
-        f"🔍 Adhoc query received: *{query}*\n"
-        f"GraphRAG + GitHub APIs module coming soon. "
-        f"Currently tracking live issue polling via AutoBot Sentinel."
-    )
 
 
 # ── Build LangGraph pipeline ──────────────────────────────────────────────────
@@ -279,8 +259,23 @@ async def trigger_poll(background_tasks: BackgroundTasks):
     return {"status": "poll cycle triggered"}
 
 
+def process_adhoc_query(clean_query: str, issue_number: int | None, channel: str, thread_ts: str):
+    """Background task to process adhoc query and send reply."""
+    try:
+        response_text = handle_adhoc_query(clean_query, issue_number)
+        slack_client.chat_postMessage(
+            channel=channel,
+            text=response_text,
+            thread_ts=thread_ts
+        )
+    except SlackApiError as e:
+        print(f"[Adhoc] Slack reply failed: {e}")
+    except Exception as e:
+        print(f"[Adhoc] Processing failed: {e}")
+
+
 @app.post("/slack/events")
-async def slack_events(request: Request):
+async def slack_events(request: Request, background_tasks: BackgroundTasks):
     """
     Slack event handler.
     Handles:
@@ -292,6 +287,10 @@ async def slack_events(request: Request):
     # Slack URL verification
     if body.get("type") == "url_verification":
         return JSONResponse({"challenge": body["challenge"]})
+
+    # Slack Event Retries: ignore them so we don't process the same query 3 times
+    if request.headers.get("X-Slack-Retry-Num"):
+        return JSONResponse({"status": "ignored retry"})
 
     # Handle events
     event = body.get("event", {})
@@ -312,18 +311,8 @@ async def slack_events(request: Request):
 
         print(f"[Adhoc] query='{clean_query}' issue={issue_number}")
 
-        # Call adhoc handler (stub for now — Phase 6 wires in teammate's module)
-        response_text = handle_adhoc_query(clean_query, issue_number)
-
-        # Reply in Slack thread
-        try:
-            slack_client.chat_postMessage(
-                channel=channel,
-                text=response_text,
-                thread_ts=thread_ts
-            )
-        except SlackApiError as e:
-            print(f"[Adhoc] Slack reply failed: {e}")
+        # Run the heavy LLM processing in the background so we can instantly return 200 to Slack
+        background_tasks.add_task(process_adhoc_query, clean_query, issue_number, channel, thread_ts)
 
     return JSONResponse({"status": "ok"})
 
@@ -338,7 +327,7 @@ async def status():
         "pipeline_nodes": [
             "poll → score → threshold_check → reason → notify"
         ],
-        "adhoc_status": "stubbed — Phase 6 pending teammate module"
+        "adhoc_status": "live — GitHub APIs + GraphRAG + LLM tool planner active"
     }
 
 

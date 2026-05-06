@@ -21,7 +21,7 @@ HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 if USE_OPENAI:
     print("Sentinel will use OpenAI API (Testing Alternative) ✅")
 else:
-    print(f"Sentinel will use HF API: {MODEL_ID} ✅")
+    print(f"Sentinel will use HF Space endpoint: {SCORER_ENDPOINT} ✅")
 
 # ── Class tokens ─────────────────────────────────────────────
 VALID_CLASSES = {"low", "medium", "high"}
@@ -78,6 +78,35 @@ def parse_class(generated_text: str) -> str:
     return "low"
 
 
+def build_scorer_input(issue: dict) -> str:
+    """
+    Build the scorer input string matching the training format exactly:
+      PROJECT: apache/airflow | P50=1d P75=6d P90=23d P95=47d
+      ISSUE: {title} | LABELS: {labels} | ASSIGNEES: {n} | DAYS_OPEN: {n} | ...
+      BODY: {body}
+      COMMENTS: {count}
+
+    Historical percentiles are fixed to apache/airflow reference values.
+    """
+    labels_str      = ", ".join(issue.get("labels", [])) or "none"
+    assignees       = issue.get("assignee_count", 0)
+    days_open       = issue.get("days_open", 0)
+    comment_count   = issue.get("comment_count", 0)
+    linked_pr_count = issue.get("linked_pr_count", 0)
+    pr_states_str   = ", ".join(issue.get("pr_states", ["none"]))
+    ci_status       = issue.get("ci_status", "none")
+    body_truncated  = (issue.get("body") or "")[:1000]
+
+    return (
+        "PROJECT: apache/airflow | P50=1d P75=6d P90=23d P95=47d\n"
+        f"ISSUE: {issue['title']} | LABELS: {labels_str} | ASSIGNEES: {assignees} | "
+        f"DAYS_OPEN: {days_open} | COMMENT_COUNT: {comment_count} | "
+        f"LINKED_PR_COUNT: {linked_pr_count} | PR_STATES: {pr_states_str} | CI: {ci_status}\n"
+        f"BODY: {body_truncated}\n"
+        f"COMMENTS: {comment_count} comments"
+    )
+
+
 def score_issue(issue: dict) -> dict:
     """
     Run Sentinel inference on a single issue.
@@ -98,29 +127,33 @@ def score_issue(issue: dict) -> dict:
             print(f"  ⚠️  OpenAI API Error: {e}")
             generated = "low" # safe fallback
     else:
-        # HTTP call to HF Space
-        payload = {
-            "title": issue["title"],
-            "body": issue.get("body") or ""
-        }
+        # Build the full training-format input string
+        scorer_input = build_scorer_input(issue)
+        payload = {"scorer_input": scorer_input}
 
         try:
-            response = requests.post(f"{SCORER_ENDPOINT}/score", headers=HEADERS, json=payload, timeout=60)
+            response = requests.post(f"{SCORER_ENDPOINT}/score", headers=HEADERS, json=payload, timeout=120)  # 120s to handle HF Space cold starts
             response.raise_for_status()
             res_json = response.json()
-            generated = res_json.get("label", "low")
+            generated        = res_json.get("label", "low")
+            confidence_score = res_json.get("score", None)       # float e.g. 0.9312
+            probabilities    = res_json.get("probabilities", {})  # {"low": 0.02, ...}
         except Exception as e:
             print(f"  ⚠️  HF Space API Error: {e}")
-            generated = "low" # safe fallback
+            generated        = "low"  # safe fallback
+            confidence_score = None
+            probabilities    = {}
 
     predicted_class = parse_class(generated)
     is_high = predicted_class == HIGH_CLASS
 
     return {
         **issue,
-        "predicted_class": predicted_class,
-        "is_high_severity": is_high,
-        "raw_output": generated.strip()
+        "predicted_class":   predicted_class,
+        "is_high_severity":  is_high,
+        "raw_output":        generated.strip(),
+        "confidence_score":  confidence_score,   # None if old Space version
+        "probabilities":     probabilities,       # {} if old Space version
     }
 
 
@@ -147,10 +180,12 @@ def run_sentinel(issues: list[dict]) -> list[dict]:
 
         try:
             scored = score_issue(issue)
-            cls = scored["predicted_class"]
-            raw = scored["raw_output"][:30]
+            cls    = scored["predicted_class"]
+            conf   = scored["confidence_score"]
+            raw    = scored["raw_output"][:30]
 
-            print(f"    → Class: {cls.upper()} | Raw: '{raw}'")
+            conf_str = f" (confidence: {conf:.2%})" if conf is not None else ""
+            print(f"    → Class: {cls.upper()}{conf_str} | Raw: '{raw}'")
 
             # Mark as seen regardless of score
             mark_seen(num, issue["title"])

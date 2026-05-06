@@ -18,9 +18,9 @@ def format_slack_message(issue: dict) -> dict:
     title       = issue["title"]
     url         = issue["url"]
     labels      = ", ".join(issue.get("labels", [])) or "none"
-    summary     = analysis.get("summary", "N/A")
-    root_cause  = analysis.get("root_cause", "N/A")
-    action      = analysis.get("suggested_action", "N/A")
+    narrative   = analysis.get("narrative") or analysis.get("root_cause", "N/A")
+    conf        = issue.get("confidence_score")
+    conf_str    = f" | Confidence: {conf:.0%}" if conf is not None else ""
 
     return {
         "channel": SLACK_CHANNEL,
@@ -30,7 +30,7 @@ def format_slack_message(issue: dict) -> dict:
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": f"🚨 HIGH Severity Issue Detected"
+                    "text": "🚨 HIGH Severity Issue Detected"
                 }
             },
             # Issue title + link
@@ -42,34 +42,27 @@ def format_slack_message(issue: dict) -> dict:
                 }
             },
             {
-                "type": "divider"
-            },
-            # Analysis fields
-            {
                 "type": "section",
                 "fields": [
                     {
                         "type": "mrkdwn",
-                        "text": f"*📋 Summary*\n{summary}"
+                        "text": f"*🏷️ Labels*\n{labels}"
                     },
                     {
                         "type": "mrkdwn",
-                        "text": f"*🏷️ Labels*\n{labels}"
+                        "text": f"*🤖 Scorer*\nhigh{conf_str}"
                     }
                 ]
             },
             {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*🔍 Root Cause*\n{root_cause}"
-                }
+                "type": "divider"
             },
+            # Full narrative from the Reasoner model
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*✅ Suggested Action*\n{action}"
+                    "text": f"*🔍 Reasoner Analysis*\n{narrative[:2900]}"
                 }
             },
             {

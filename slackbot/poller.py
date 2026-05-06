@@ -12,20 +12,159 @@ HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28"
 }
 
-def fetch_open_issues(max_pages: int = 3) -> list[dict]:
+def _compute_days_open(created_at: str) -> int:
+    """Compute how many days an issue has been open since creation."""
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        now = datetime.now(created.tzinfo)
+        return (now - created).days
+    except Exception:
+        return 0
+
+
+def _fetch_pr_states_with_numbers(issue_number: int) -> tuple[list[str], list[int]]:
     """
-    Fetch open issues from GitHub API.
-    Returns list of {issue_number, title, body} dicts.
-    Skips pull requests (GitHub API returns PRs as issues too).
+    Fetch states and numbers of PRs linked to this issue via timeline API.
+    Returns (pr_states, pr_numbers).
+    """
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}/timeline"
+    headers_tl = {**HEADERS, "Accept": "application/vnd.github.mockingbird-preview+json"}
+    try:
+        resp = requests.get(url, headers=headers_tl, timeout=10)
+        if resp.status_code != 200:
+            return ["none"], []
+        events = resp.json()
+        pr_states, pr_numbers = [], []
+        for evt in events:
+            if evt.get("event") == "cross-referenced":
+                source = evt.get("source", {})
+                issue_ref = source.get("issue", {})
+                if "pull_request" in issue_ref:
+                    pr_states.append(issue_ref.get("state", "unknown"))
+                    pr_numbers.append(issue_ref.get("number", 0))
+        return (pr_states or ["none"]), pr_numbers
+    except Exception:
+        return ["none"], []
+
+
+def _fetch_issue_comments(issue_number: int) -> tuple[str, float]:
+    """
+    Fetch issue comments. Returns:
+      - formatted comment string matching training format
+      - max gap in days between consecutive comments (MAX_COMMENT_GAP_DAYS)
+    """
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues/{issue_number}/comments"
+    try:
+        resp = requests.get(url, headers=HEADERS, params={"per_page": 10}, timeout=10)
+        if resp.status_code != 200:
+            return "", 0.0
+        comments = resp.json()
+        if not comments:
+            return "", 0.0
+
+        lines = []
+        timestamps = []
+        for c in comments[:10]:  # cap at 10 comments
+            author = c.get("user", {}).get("login", "unknown")
+            created = c.get("created_at", "")
+            body = (c.get("body") or "")[:200].replace("\n", " ")
+            lines.append(f"- [{created}] {author}: {body}...")
+            try:
+                timestamps.append(datetime.fromisoformat(created.replace("Z", "+00:00")))
+            except Exception:
+                pass
+
+        # Compute max gap between consecutive comments
+        max_gap = 0.0
+        if len(timestamps) > 1:
+            timestamps.sort()
+            gaps = [(timestamps[i+1] - timestamps[i]).total_seconds() / 86400
+                    for i in range(len(timestamps) - 1)]
+            max_gap = round(max(gaps), 1)
+
+        return "\n".join(lines), max_gap
+    except Exception:
+        return "", 0.0
+
+
+def _fetch_pr_review_feedback(pr_numbers: list[int]) -> tuple[int, str]:
+    """
+    Fetch PR review activity for linked PRs. Returns:
+      - silent_reviewers: count of reviewers who commented but did not approve
+      - feedback_text: formatted review feedback matching training format
+    """
+    if not pr_numbers:
+        return 0, ""
+
+    feedback_lines = []
+    all_reviewers = set()
+    approvers = set()
+
+    for pr_num in pr_numbers[:3]:  # cap at 3 PRs
+        # Fetch reviews
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_num}/reviews"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            if resp.status_code == 200:
+                for review in resp.json()[:10]:
+                    reviewer = review.get("user", {}).get("login", "unknown")
+                    state = review.get("state", "")  # APPROVED, CHANGES_REQUESTED, COMMENTED
+                    body = (review.get("body") or "")[:200].replace("\n", " ")
+                    all_reviewers.add(reviewer)
+                    if state == "APPROVED":
+                        approvers.add(reviewer)
+                    if body:
+                        feedback_lines.append(
+                            f"[PR #{pr_num} {state} by {reviewer}]: {body}..."
+                        )
+        except Exception:
+            pass
+
+        # Fetch inline review comments (top 5)
+        url2 = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_num}/comments"
+        try:
+            resp2 = requests.get(url2, headers=HEADERS, params={"per_page": 5}, timeout=10)
+            if resp2.status_code == 200:
+                for comment in resp2.json()[:5]:
+                    reviewer = comment.get("user", {}).get("login", "unknown")
+                    body = (comment.get("body") or "")[:150].replace("\n", " ")
+                    path = comment.get("path", "")
+                    all_reviewers.add(reviewer)
+                    if body:
+                        feedback_lines.append(
+                            f"[{reviewer} on {path}]: {body}..."
+                        )
+        except Exception:
+            pass
+
+    silent = len(all_reviewers - approvers)
+    feedback_text = "\n".join(feedback_lines[:10]) if feedback_lines else ""
+    return silent, feedback_text
+
+
+def fetch_open_issues(max_pages: int = 1) -> list[dict]:
+    """
+    Fetch open issues from GitHub API with rich metadata matching scorer training format.
+    Fields collected: title, body, labels, assignees, days_open, comment_count,
+                      linked_pr_count, pr_states, ci_status.
+
+    NOTE: max_pages=1, per_page=5 for testing. Set max_pages=3, per_page=30 for production.
     """
     issues = []
 
-    for page in range(1, max_pages + 1):
+    import random
+
+    # Dual-Snapshot Strategy:
+    # 1. Always fetch page 1 (the 30 most recently updated issues) to catch live activity.
+    # 2. Fetch a random page (between 2 and 50) to continuously audit the deep backlog.
+    pages_to_fetch = [1, random.randint(2, 50)]
+
+    for page_num in pages_to_fetch:
         params = {
             "state": "open",
             "per_page": 30,
-            "page": page,
-            "sort": "created",
+            "page": page_num,
+            "sort": "updated",
             "direction": "desc"
         }
 
@@ -48,16 +187,45 @@ def fetch_open_issues(max_pages: int = 3) -> list[dict]:
             if "pull_request" in item:
                 continue
 
+            issue_number   = item["number"]
+            created_at     = item["created_at"]
+            days_open      = _compute_days_open(created_at)
+            comment_count  = item.get("comments", 0)
+            assignee_count = len(item.get("assignees", []))
+
+            # Fetch linked PR states + numbers (1 API call)
+            pr_states, pr_numbers = _fetch_pr_states_with_numbers(issue_number)
+            linked_pr_count = len([s for s in pr_states if s != "none"])
+
+            # Fetch issue comments text + max gap (1 API call)
+            comments_text, max_comment_gap_days = _fetch_issue_comments(issue_number)
+
+            # Fetch PR review feedback + silent reviewers (1-2 API calls per PR)
+            silent_reviewers, pr_review_feedback = _fetch_pr_review_feedback(pr_numbers)
+
             issues.append({
-                "issue_number": item["number"],
-                "title": item["title"],
-                "body": item.get("body") or "",  # body can be None
-                "url": item["html_url"],
-                "created_at": item["created_at"],
-                "labels": [l["name"] for l in item.get("labels", [])]
+                # Core fields
+                "issue_number":         issue_number,
+                "title":                item["title"],
+                "body":                 item.get("body") or "",
+                "url":                  item["html_url"],
+                "created_at":           created_at,
+                "labels":               [lb["name"] for lb in item.get("labels", [])],
+                # Rich metadata for scorer and reasoner (matches training format)
+                "days_open":            days_open,
+                "comment_count":        comment_count,
+                "assignee_count":       assignee_count,
+                "linked_pr_count":      linked_pr_count,
+                "pr_states":            pr_states,
+                "pr_numbers":           pr_numbers,
+                "ci_status":            "none",   # placeholder — requires extra PR head SHA lookup
+                "max_comment_gap_days": max_comment_gap_days,
+                "comments_text":        comments_text,
+                "silent_reviewers":     silent_reviewers,
+                "pr_review_feedback":   pr_review_feedback,
             })
 
-        print(f"  Page {page}: fetched {len(page_data)} items")
+        print(f"  Page {page_num}: fetched {len(page_data)} items")
 
     return issues
 
@@ -83,17 +251,15 @@ def poll_once() -> list[dict]:
     all_issues = fetch_open_issues()
     print(f"Fetched {len(all_issues)} open issues (excl. PRs)")
 
-    # Filter already-seen
-    new_issues = filter_new_issues(all_issues)
-    print(f"New unseen issues: {len(new_issues)}")
-
-    if new_issues:
-        for issue in new_issues:
+    # Return ALL fetched issues without filtering them by the seen cache
+    # so they get continuously scored every 5 minutes.
+    if all_issues:
+        for issue in all_issues:
             print(f"  → #{issue['issue_number']}: {issue['title'][:70]}")
     else:
         print("  No new issues this cycle.")
 
-    return new_issues
+    return all_issues
 
 def run_poller(scoring_callback=None):
     """
